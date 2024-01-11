@@ -1,11 +1,17 @@
 ---
 name: ci extended
 # yamllint disable-line rule:truthy
-on: push
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    paths:
+      - 'container/**'
 jobs:
   test-containers:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
       - name: Test our container definitions
         run: tools/test_containers

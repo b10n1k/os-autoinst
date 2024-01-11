@@ -23,7 +23,7 @@ use constant VARS_DOC => DOC_DIR . '/backend_vars.asciidoc';
 my @backend_blocklist = qw();
 # blocklist of vars per backend. These vars will be ignored during vars exploration
 my %var_blocklist = (
-    QEMU => ['WORKER_ID', 'WORKER_INSTANCE'],
+    QEMU => ['WORKER_ID', 'WORKER_INSTANCE', 'NAME'],
     VAGRANT => ['QEMUCPUS', 'QEMURAM'],
     GENERALHW => ['HDD_1'],
     SVIRT => ['JOBTOKEN'],
@@ -38,8 +38,6 @@ my $error_found = 0;
 my $ignore_errors = 1;
 
 my $table_header = 'Variable;Values allowed;Default value;Explanation';
-
-sub say ($text) { print STDERR "$text\n" }
 
 sub read_doc () {
     # read and parse old vars doc
@@ -62,9 +60,7 @@ sub read_doc () {
                 next unless ($var);
                 $default = '' unless (defined $default);
                 $value = '' unless (defined $value);
-                unless ($explanation) {
-                    fail "still missing explanation for backend $backend variable $var";
-                }
+                fail "still missing explanation for backend $backend variable $var" unless $explanation;
                 $documented_vars{$backend}{$var} = [$value, $default, $explanation];
             }
         }
@@ -72,7 +68,7 @@ sub read_doc () {
     close($docfh);
 }
 
-sub write_doc {
+sub write_doc () {
     my $docfh;
     open($docfh, '>', VARS_DOC . '.newvars');
     print $docfh <<EO_HEADER;
@@ -94,9 +90,9 @@ EO_BACKEND_HEADER
             next if ($var =~ /^\$[a-zA-Z]/);
             next if (grep { /$var/ } @{$var_blocklist{$backend}});
             unless ($documented_vars{$backend}{$var}) {
-                $error_found = 1;
-                $documented_vars{$backend}{$var} = ['', '', ''];
-                fail "missing documentation for backend $backend variable $var, please update backend_vars";
+                $error_found = 1;    # uncoverable statement
+                $documented_vars{$backend}{$var} = ['', '', ''];    # uncoverable statement
+                fail "missing documentation for backend $backend variable $var, please update backend_vars";    # uncoverable statement
             }
             my @var_docu = @{$documented_vars{$backend}{$var}};
             printf $docfh "%s;%s;%s;%s\n", $var, @var_docu;
@@ -108,17 +104,16 @@ EO_BACKEND_FOOTER
     }
 }
 
-sub read_backend_pm {
+sub read_backend_pm {    # no:style:signatures
     my ($backend) = $_ =~ /^([^\.]+)\.pm/;
     return unless $backend;
+    # uncoverable statement count:2
     return if (grep { /$backend/i } @backend_blocklist);
     $backend = uc $backend;
     $backend = uc $backend_renames{$backend} if $backend_renames{$backend};
     my $fh;
     eval { open($fh, '<', $File::Find::name) };
-    if (my $E = $@) {
-        say 'Unable to open ' . $File::Find::name && return;
-    }
+    return fail 'Unable to open ' . $File::Find::name if $@;
     for my $line (<$fh>) {
         my @vars = $line =~ /(?:\$bmwqemu::|\$)vars(?:->)?{["']?([^}"']+)["']?}/g;
         for my $var (@vars) {

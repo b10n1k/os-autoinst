@@ -36,6 +36,7 @@ requires 'IO::Socket::UNIX';
 requires 'IPC::Open3';
 requires 'IPC::Run::Debug';
 requires 'IPC::System::Simple';
+requires 'JSON::Validator';
 requires 'List::MoreUtils';
 requires 'List::Util';
 requires 'Mojo::IOLoop::ReadWriteProcess', '>= 0.26';
@@ -43,9 +44,10 @@ requires 'Mojo::JSON';
 requires 'Mojo::Log';
 requires 'Mojo::URL';
 requires 'Mojo::UserAgent';
-requires 'Mojolicious', '>= 8.42';
+requires 'Mojolicious', '>= 9.34';
 requires 'Mojolicious::Lite';
 requires 'Net::DBus';
+requires 'Net::Domain';
 requires 'Net::IP';
 requires 'Net::SNMP';
 requires 'Net::SSH2';
@@ -61,6 +63,8 @@ requires 'Time::Seconds';
 requires 'Try::Tiny';
 requires 'XML::LibXML';
 requires 'XML::SemanticDiff';
+requires 'YAML::PP';
+requires 'YAML::XS';
 requires 'autodie';
 requires 'base';
 requires 'constant';
@@ -76,7 +80,7 @@ on 'test' => sub {
     requires 'Inline::Python';
     requires 'Mojo::IOLoop::ReadWriteProcess', '>= 0.28';
     requires 'Perl::Critic';
-    requires 'Perl::Critic::Freenode';
+    requires 'Perl::Critic::Community';
     requires 'Perl::Critic::Policy';
     requires 'Perl::Critic::Utils';
     requires 'Pod::Coverage';
@@ -91,7 +95,6 @@ on 'test' => sub {
     requires 'Test::Pod';
     requires 'Test::Strict';
     requires 'Test::Warnings', '>= 0.029';
-    requires 'YAML::PP';
 
 };
 
@@ -99,7 +102,8 @@ on 'devel' => sub {
     requires 'Code::TidyAll';
     requires 'Devel::Cover';
     requires 'Devel::Cover::Report::Codecov';
-    requires 'Perl::Tidy', '== 20220217';
+    requires 'Perl::Tidy', '== 20230912';
+    requires 'Template::Toolkit';
 
 };
 

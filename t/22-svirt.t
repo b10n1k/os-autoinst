@@ -13,11 +13,12 @@ use Test::Mock::Time;
 use Mojo::Log;
 use XML::SemanticDiff;
 use backend::svirt;
+use consoles::sshVirtsh;
 use distribution;
 use Net::SSH2;
 use testapi qw(get_var get_required_var check_var set_var);
-use backend::svirt qw(SERIAL_CONSOLE_DEFAULT_PORT SERIAL_TERMINAL_DEFAULT_DEVICE SERIAL_TERMINAL_DEFAULT_PORT);
-use Mojo::File 'tempdir';
+use backend::svirt qw(SERIAL_CONSOLE_DEFAULT_PORT SERIAL_TERMINAL_DEFAULT_DEVICE SERIAL_TERMINAL_DEFAULT_PORT SERIAL_USER_TERMINAL_DEFAULT_DEVICE SERIAL_USER_TERMINAL_DEFAULT_PORT);
+use Mojo::File qw(tempdir path);
 use Mojo::Util qw(scope_guard);
 
 my $dir = tempdir("/tmp/$FindBin::Script-XXXX");
@@ -30,22 +31,34 @@ bmwqemu::init_logger;
 set_var(WORKER_HOSTNAME => 'foo');
 set_var(VIRSH_HOSTNAME => 'bar');
 set_var(VIRSH_PASSWORD => 'password');
+set_var(SVIRT_WORKER_CACHE => 1);
 
-my $distri = $testapi::distri = distribution->new();
-my $svirt = backend::svirt->new();
+my $ssh_xterm_vt_mock = Test::MockModule->new('consoles::sshXtermVt');
+$ssh_xterm_vt_mock->noop('activate');
 
-is_deeply({$svirt->get_ssh_credentials()}, {
+my $distri = $testapi::distri = distribution->new;
+my $svirt = backend::svirt->new;
+is_deeply({$svirt->get_ssh_credentials}, {
         hostname => 'bar',
         username => 'root',
         password => 'password',
-}, 'read credentials');
+}, 'reading SSH credentials via svirt backend, username defaults to "root"');
+
+my $ssh_virtsh = consoles::sshVirtsh->new(undef, {hostname => 'some-host', password => 'foo'});
+$ssh_virtsh->activate;
+is_deeply({$ssh_virtsh->get_ssh_credentials}, {
+        hostname => 'some-host',
+        username => 'root',
+        password => 'foo',
+}, 'reading SSH credentials via sshVirtsh console, username defaults to "root"');
 
 $svirt->do_start_vm;
-$distri->add_console('sut-serial', 'ssh-virtsh-serial', {});
+$distri->add_console('root-sut-serial', 'ssh-virtsh-serial', {});
+$distri->add_console('user-sut-serial', 'ssh-virtsh-serial', {});
 
 my $consoles = $distri->{consoles};
 my $svirt_console = $consoles->{svirt};
-my $svirt_sut_console = $consoles->{'sut-serial'};
+my $svirt_sut_console = $consoles->{'root-sut-serial'};
 
 subtest 'svirt console correctly initialized' => sub {
     ok($svirt_console);
@@ -65,18 +78,18 @@ is_deeply($svirt_sut_console, {
         console_hotkey => 'ctrl-alt-f',
         libvirt_domain => 'openQA-SUT-1',
         serial_port_no => 1,
-        testapi_console => 'sut-serial',
+        testapi_console => 'root-sut-serial',
         pty_dev => SERIAL_TERMINAL_DEFAULT_DEVICE,
 }, 'SUT serial console correctly initialized') or diag explain $consoles;
 
 sub _is_xml ($actual_xml_data, $expected_xml_file_path) {
     my $diff = XML::SemanticDiff->new(keeplinenums => 1);
     if (my @changes = $diff->compare($actual_xml_data, $expected_xml_file_path)) {
-        fail 'XML not as expected';
-        diag explain 'differences:', \@changes;
-        note 'produced XML:';
-        note $actual_xml_data;
-        return 0;
+        fail 'XML not as expected';    # uncoverable statement
+        diag explain 'differences:', \@changes;    # uncoverable statement
+        note 'produced XML:';    # uncoverable statement
+        note $actual_xml_data;    # uncoverable statement
+        return 0;    # uncoverable statement
     }
     ok 'XML looks as expected';
 }
@@ -86,6 +99,7 @@ subtest 'XML config for VNC and serial console' => sub {
     $svirt_console->add_vnc({port => 5901});
     $svirt_console->add_pty({target_port => SERIAL_CONSOLE_DEFAULT_PORT});
     $svirt_console->add_pty({pty_dev => SERIAL_TERMINAL_DEFAULT_DEVICE, pty_dev_type => 'pty', target_port => SERIAL_TERMINAL_DEFAULT_PORT});
+    $svirt_console->add_pty({pty_dev => SERIAL_USER_TERMINAL_DEFAULT_DEVICE, pty_dev_type => 'pty', target_port => SERIAL_USER_TERMINAL_DEFAULT_PORT});
     _is_xml $svirt_console->{domainxml}->toString(2), "$Bin/22-svirt-virsh-config.xml";
 };
 
@@ -98,7 +112,7 @@ subtest 'XML config with UEFI loader and VMware' => sub {
 
     my $console_mock = Test::MockModule->new('consoles::sshVirtsh');
     $console_mock->redefine(run_cmd => 1);
-    throws_ok { $svirt_console->_init_xml } qr/No UEFI firmware can be found on hypervisor/, 'dies if UEFI firmware missing';
+    lives_ok { $svirt_console->_init_xml } 'UEFI firmware can be found on hypervisor';
 
     $console_mock->redefine(run_cmd => 0);
     $svirt_console->_init_xml;
@@ -110,12 +124,13 @@ subtest 'starting VMware console' => sub {
     $bmwqemu::vars{VMWARE_USERNAME} = 'u';
     $bmwqemu::vars{VMWARE_PASSWORD} = 'p';
 
-    my $chan_mock = Test::MockObject->new->set_true(qw(write send_eof close));
+    my $chan_mock = Test::MockObject->new->set_true(qw(write send_eof close read2 eof exit_status));
     my $backend_mock = Test::MockModule->new('backend::svirt');
     my $console_mock = Test::MockModule->new('consoles::sshVirtsh');
     my $tmp_mock = Test::MockModule->new('File::Temp');
     my (@cmds, @ssh_cmds);
     $console_mock->redefine(run_cmd => sub ($self, $cmd, %args) { push @cmds, $cmd; 0 });
+    $console_mock->redefine(get_cmd_output => sub ($self, $cmd, %args) { push @cmds, $cmd; 0 });
     $backend_mock->redefine(run_ssh => sub ($self, $cmd, %args) { push @ssh_cmds, $cmd; (undef, $chan_mock) });
     $backend_mock->redefine(start_serial_grab => 1);
     $console_mock->redefine(get_ssh_credentials => sub { (hostname => 'foo', username => 'root', password => '123') });
@@ -128,7 +143,44 @@ subtest 'starting VMware console' => sub {
         $s . ' destroy openQA-SUT-1 |& grep -v "\\(failed to get domain\\|Domain not found\\)"',
         $s . ' undefine --snapshots-metadata openQA-SUT-1 |& grep -v "\\(failed to get domain\\|Domain not found\\)"',
         $s . ' define /var/lib/libvirt/images/openQA-SUT-1.xml',
-        'echo bios.bootDelay = \\"10000\\" >> /vmfs/volumes/datastore1/openQA/openQA-SUT-1.vmx',
+        'echo \'bios.bootDelay = "10000"\' >> /vmfs/volumes/datastore1/openQA/openQA-SUT-1.vmx',
+        $s . ' start openQA-SUT-1 2> >(tee /tmp/os-autoinst-openQA-SUT-1-stderr.log >&2)',
+        $s . ' dumpxml openQA-SUT-1'
+    ], 'expected commands invoked' or diag explain \@cmds;
+};
+
+subtest 'starting VMware console with Cloud Init' => sub {
+    $bmwqemu::vars{VMWARE_HOST} = 'h';
+    $bmwqemu::vars{VMWARE_USERNAME} = 'u';
+    $bmwqemu::vars{VMWARE_PASSWORD} = 'p';
+    $bmwqemu::vars{CLOUD_INIT_META} = 'test@meta';
+    $bmwqemu::vars{CLOUD_INIT_USER} = 'test%user';
+    $bmwqemu::vars{CLOUD_INIT_ENCODING} = 'gzip+base64';
+
+    my $chan_mock = Test::MockObject->new->set_true(qw(write send_eof close read2 eof exit_status));
+    my $backend_mock = Test::MockModule->new('backend::svirt');
+    my $console_mock = Test::MockModule->new('consoles::sshVirtsh');
+    my $tmp_mock = Test::MockModule->new('File::Temp');
+    my (@cmds, @ssh_cmds);
+    $console_mock->redefine(run_cmd => sub ($self, $cmd, %args) { push @cmds, $cmd; 0 });
+    $console_mock->redefine(get_cmd_output => sub ($self, $cmd, %args) { push @cmds, $cmd; 0 });
+    $backend_mock->redefine(run_ssh => sub ($self, $cmd, %args) { push @ssh_cmds, $cmd; (undef, $chan_mock) });
+    $backend_mock->redefine(start_serial_grab => 1);
+    $console_mock->redefine(get_ssh_credentials => sub { (hostname => 'foo', username => 'root', password => '123') });
+    $tmp_mock->redefine(tempfile => sub { (undef, '/t') });
+
+    $svirt_console->define_and_start;
+    like shift @cmds, qr/cat > \/t <<.*username=u.*password=p.*auth-esx-h/s, 'config written';
+    my $s = 'virsh -c esx://u@h/?no_verify=1\\&authfile=/t ';
+    is_deeply \@cmds, [
+        $s . ' destroy openQA-SUT-1 |& grep -v "\\(failed to get domain\\|Domain not found\\)"',
+        $s . ' undefine --snapshots-metadata openQA-SUT-1 |& grep -v "\\(failed to get domain\\|Domain not found\\)"',
+        $s . ' define /var/lib/libvirt/images/openQA-SUT-1.xml',
+        'echo \'bios.bootDelay = "10000"\' >> /vmfs/volumes/datastore1/openQA/openQA-SUT-1.vmx',
+        'echo \'guestinfo.metadata = "test@meta"\' >> /vmfs/volumes/datastore1/openQA/openQA-SUT-1.vmx',
+        'echo \'guestinfo.metadata.encoding = "gzip+base64"\' >> /vmfs/volumes/datastore1/openQA/openQA-SUT-1.vmx',
+        'echo \'guestinfo.userdata = "test%user"\' >> /vmfs/volumes/datastore1/openQA/openQA-SUT-1.vmx',
+        'echo \'guestinfo.userdata.encoding = "gzip+base64"\' >> /vmfs/volumes/datastore1/openQA/openQA-SUT-1.vmx',
         $s . ' start openQA-SUT-1 2> >(tee /tmp/os-autoinst-openQA-SUT-1-stderr.log >&2)',
         $s . ' dumpxml openQA-SUT-1'
     ], 'expected commands invoked' or diag explain \@cmds;
@@ -305,8 +357,7 @@ subtest 'Method backend::svirt::open_serial_console_via_ssh()' => sub {
     is(shift @deleted_logs, $expected_serial_file, "Check if $expected_serial_file was deleted on die()");
 };
 
-sub svirt_xml_validate {
-    my ($svirt, %args) = @_;
+sub svirt_xml_validate ($svirt, %args) {
     $args{disk_device} //= 'disk';
     die 'missing dev' unless $args{dev};
     die 'missing bus' unless $args{bus};
@@ -340,6 +391,11 @@ subtest 'Method consoles::sshVirtsh::add_disk()' => sub {
     my @last_ssh_args;
     my @ssh_cmd_return;
     my $_10gb = 1024 * 1024 * 1024 * 10;
+
+    my $console_mock = Test::MockModule->new('consoles::sshVirtsh');
+    my @last_system_calls;
+    $console_mock->redefine(_system => sub { push @last_system_calls, join ' ', @_; return 0 });
+    $console_mock->redefine(which => 1);
 
     my $mock_baseclass = Test::MockModule->new('backend::baseclass');
     $mock_baseclass->redefine('run_ssh_cmd' => sub {
@@ -536,7 +592,7 @@ subtest 'Method consoles::sshVirtsh::add_disk()' => sub {
                     size => 12
             });
             like($last_ssh_commands[0], qr%^rsync.*/my/path/to/this/file/$file.*$basedir/$file%, 'Use rsync to copy file');
-            is($last_ssh_commands[-1], "qemu-img create '${basedir}openQA-SUT-1$dev_id.img' -f qcow2 -b '$basedir/$file' 12G", 'Used image size > backingfile size');
+            is($last_ssh_commands[-1], "qemu-img create '${basedir}openQA-SUT-1$dev_id.img' -f qcow2 -F qcow2 -b '$basedir/$file' 12G", 'Used image size > backingfile size');
         };
 
         subtest 'family svirt-xen-hvm backingfile=1 size smaller backingfile-size' => sub {
@@ -551,7 +607,7 @@ subtest 'Method consoles::sshVirtsh::add_disk()' => sub {
                     size => 5
             });
             like($last_ssh_commands[0], qr%^rsync.*/my/path/to/this/file/$file.*$basedir/$file%, 'Use rsync to copy file');
-            is($last_ssh_commands[-1], "qemu-img create '${basedir}openQA-SUT-1$dev_id.img' -f qcow2 -b '$basedir/$file' $_10gb", 'Used image size <= backingfile size');
+            is($last_ssh_commands[-1], "qemu-img create '${basedir}openQA-SUT-1$dev_id.img' -f qcow2 -F qcow2 -b '$basedir/$file' $_10gb", 'Used image size <= backingfile size');
 
             svirt_xml_validate($svirt,
                 dev => 'xvd' . $dev_id,
@@ -640,7 +696,7 @@ subtest 'Method consoles::sshVirtsh::add_disk()' => sub {
                     size => 12
             });
             like($last_ssh_commands[0], qr%^rsync.*/my/path/to/this/file/$file.*$basedir/$file%, 'Use rsync to copy file');
-            is($last_ssh_commands[-1], "qemu-img create '${basedir}openQA-SUT-1$dev_id.img' -f qcow2 -b '$basedir/$file' 12G", 'Used image size > backingfile size');
+            is($last_ssh_commands[-1], "qemu-img create '${basedir}openQA-SUT-1$dev_id.img' -f qcow2 -F qcow2 -b '$basedir/$file' 12G", 'Used image size > backingfile size');
         };
 
         subtest 'family kvm backingfile=1 size smaller then backingfile' => sub {
@@ -655,7 +711,7 @@ subtest 'Method consoles::sshVirtsh::add_disk()' => sub {
                     size => 5
             });
             like($last_ssh_commands[0], qr%^rsync.*/my/path/to/this/file/$file.*$basedir/$file%, 'Use rsync to copy file');
-            is($last_ssh_commands[-1], "qemu-img create '${basedir}openQA-SUT-1$dev_id.img' -f qcow2 -b '$basedir/$file' $_10gb", 'Used image size <= backingfile size');
+            is($last_ssh_commands[-1], "qemu-img create '${basedir}openQA-SUT-1$dev_id.img' -f qcow2 -F qcow2 -b '$basedir/$file' $_10gb", 'Used image size <= backingfile size');
 
             svirt_xml_validate($svirt,
                 dev => 'vd' . $dev_id,
@@ -686,19 +742,17 @@ subtest 'Method consoles::sshVirtsh::add_disk()' => sub {
             );
         };
 
-        subtest 'family kvm cdrom=1 xz file' => sub {
+        subtest 'family kvm cdrom=1 xz file, using cached file' => sub {
             my $dev_id = 'dev_id_018';
             my $file_wo_xz = "my_compressed_cdrom_$dev_id.iso";
-            my $file = $file_wo_xz . '.xz';
+            my $file = path($file_wo_xz . '.xz')->touch;
+            my $file_path = '/my/path/to/this/file/' . $file;
+            @last_system_calls = ();
             @last_ssh_commands = ();
             @ssh_cmd_return = (0, 0);
-            $svirt->add_disk({
-                    cdrom => 1,
-                    dev_id => $dev_id,
-                    file => '/my/path/to/this/file/' . $file,
-            });
-            like($last_ssh_commands[0], qr%^rsync.*/my/path/to/this/file/$file.*$basedir/$file%, 'Use rsync to copy cdrom iso');
-            like($last_ssh_commands[1], qr%unxz%, 'Uncompress file with unxz');
+            $svirt->add_disk({cdrom => 1, dev_id => $dev_id, file => $file_path});
+            is $last_system_calls[0], "sshpass -p 'password_svirt' rsync -e 'ssh -o StrictHostKeyChecking=no' -av '$dir/$file' 'root\@hostname_svirt:$basedir/$file'", 'file copied with rsync';
+            like $last_ssh_commands[0], qr%unxz%, 'file uncompressed with unxz';
 
             svirt_xml_validate($svirt,
                 disk_device => 'cdrom',

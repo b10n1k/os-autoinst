@@ -45,21 +45,13 @@ sub run_cmd ($self, $cmd, @extra_args) {
 
     push @full_cmd, @extra_args;
 
-    my ($stdin, $stdout, $stderr, $ret);
-
-    {
-        # Do not let the SIGCHLD handler of Mojo::IOLoop::ReadWriteProcess::Session steal the exit code from IPC::Run
-        local $SIG{CHLD};
-        eval { $ret = IPC::Run::run(\@full_cmd, \$stdin, \$stdout, \$stderr) };
-        die "Unable to run command '@full_cmd' (deduced from test variable $cmd): $@\n" if $@;
-    }
-    chomp $stdout;
-    chomp $stderr;
-
-    die "$cmd: stdout: $stdout, stderr: $stderr" unless $ret;
-    bmwqemu::diag("IPMI: stdout: $stdout, stderr: $stderr");
-    return $stdout;
+    bmwqemu::diag("Calling $cmd");
+    my $ret = _system(@full_cmd);
+    die "Failed to run command '@full_cmd' (deduced from test variable $cmd): $ret\n" if ($ret != 0);
 }
+
+# wrapper to be mocked in os-autoinst unit tests as it is hard to mock system()
+sub _system (@cmd) { system(@cmd) }    # uncoverable statement
 
 sub poweroff_host ($self) {
     $self->run_cmd('GENERAL_HW_POWEROFF_CMD');
@@ -96,7 +88,7 @@ sub relogin_vnc ($self) {
             hostname => $bmwqemu::vars{GENERAL_HW_VNC_IP} || die('Need variable GENERAL_HW_VNC_IP'),
             port => $bmwqemu::vars{GENERAL_HW_VNC_PORT} // 5900,
             password => $bmwqemu::vars{GENERAL_HW_VNC_PASSWORD},
-            depth => 16,
+            depth => $bmwqemu::vars{GENERAL_HW_VNC_DEPTH} // 16,
             connect_timeout => 50
         });
     $vnc->backend($self);
@@ -173,18 +165,20 @@ sub check_socket ($self, $fh, $write = undef) {
 sub start_serial_grab ($self) {
     $self->{serialpid} = fork();
     return unless $self->{serialpid} == 0;
-    setpgrp 0, 0;
-    open(my $serial, '>', $self->{serialfile});
-    open(STDOUT, ">&", $serial);
-    open(STDERR, ">&", $serial);
-    exec($self->get_cmd('GENERAL_HW_SOL_CMD'));
-    die "exec failed $!";
+    setpgrp 0, 0;    # uncoverable statement
+    open(my $serial, '>', $self->{serialfile});    # uncoverable statement
+    open(STDOUT, ">&", $serial);    # uncoverable statement
+    open(STDERR, ">&", $serial);    # uncoverable statement
+    exec($self->get_cmd('GENERAL_HW_SOL_CMD'));    # uncoverable statement
+    die "exec failed $!";    # uncoverable statement
 }
 
 sub stop_serial_grab ($self, @) {
-    return unless $self->{serialpid};
-    kill("-TERM", $self->{serialpid});
-    return waitpid($self->{serialpid}, 0);
+    return 0 unless $self->{serialpid};
+    eval { kill -TERM => $self->{serialpid} };
+    return waitpid($self->{serialpid}, 0) unless my $error = $@;
+    return -1 if $error =~ qr/No such process/i;
+    die "$error\n" if $error;    # uncoverable statement
 }
 
 # serial grab end

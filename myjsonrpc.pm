@@ -12,7 +12,7 @@ use Cpanel::JSON::XS ();
 use bmwqemu ();
 
 use constant DEBUG_JSON => $ENV{PERL_MYJSONRPC_DEBUG} || 0;
-use constant READ_BUFFER => $ENV{PERL_MYJSONRPC_BYTES} || 8000000;
+use constant READ_BUFFER => $ENV{PERL_MYJSONRPC_BYTES} || 8_000_000;
 
 sub send_json ($to_fd, $cmd) {
     # allow regular expressions to be automatically converted into
@@ -28,12 +28,12 @@ sub send_json ($to_fd, $cmd) {
     $cmdcopy{json_cmd_token} ||= bmwqemu::random_string(8);
 
     my $json = $cjx->encode(\%cmdcopy);
-    if (DEBUG_JSON) {
+    if (DEBUG_JSON || $bmwqemu::vars{DEBUG_JSON_RPC}) {
         my $copy = $json;
         # shorten long content
         $copy =~ s/"([^"]{30})[^"]+"/"$1"/g;
         my $fd = fileno($to_fd);
-        bmwqemu::diag("($$) send_json($fd) JSON=$copy");
+        bmwqemu::diag("send_json($fd) JSON=$copy");
     }
     $json .= "\n";
 
@@ -51,10 +51,10 @@ our $sockets;
 
 # utility function
 sub read_json ($socket, $cmd_token = undef, $multi = undef) {
-    my $cjx = Cpanel::JSON::XS->new;
+    my $cjx = Cpanel::JSON::XS->new->utf8;
 
     my $fd = fileno($socket);
-    bmwqemu::diag("($$) read_json($fd)") if DEBUG_JSON;
+    bmwqemu::diag("read_json($fd)") if DEBUG_JSON || $bmwqemu::vars{DEBUG_JSON_RPC};
     if (exists $sockets->{$fd}) {
         # start with the trailing text from previous call
         my $buffer = delete $sockets->{$fd};
@@ -74,9 +74,9 @@ sub read_json ($socket, $cmd_token = undef, $multi = undef) {
         # remember the trailing text
         if ($hash) {
             $sockets->{$fd} = $cjx->incr_text();
-            if (DEBUG_JSON) {
+            if (DEBUG_JSON || $bmwqemu::vars{DEBUG_JSON_RPC}) {
                 my $token = $hash->{json_cmd_token} // 'no-token';
-                bmwqemu::diag("($$) read_json($fd) json_cmd_token=$token");
+                bmwqemu::diag("read_json($fd) json_cmd_token=$token");
             }
             if ($hash->{QUIT}) {
                 bmwqemu::diag("received magic close");
@@ -101,14 +101,14 @@ sub read_json ($socket, $cmd_token = undef, $multi = undef) {
             my $error = $!;
             confess "ERROR: unable to wait for JSON reply: $error\n" unless $!{EINTR};
             # try again if can_read's underlying system call has been interrupted as suggested by the perlipc documentation
-            bmwqemu::diag("($$) read_json($fd): can_read's underlying system call has been interrupted, trying again\n") if DEBUG_JSON;
+            bmwqemu::diag("read_json($fd): can_read's underlying system call has been interrupted, trying again\n") if DEBUG_JSON || $bmwqemu::vars{DEBUG_JSON_RPC};
             @res = $s->can_read;
         }
 
         my $qbuffer;
         my $bytes = sysread($socket, $qbuffer, READ_BUFFER);
         if (!$bytes) {
-            bmwqemu::fctwarn("sysread failed: $!") if DEBUG_JSON;
+            bmwqemu::fctwarn("sysread failed: $!") if DEBUG_JSON || $bmwqemu::vars{DEBUG_JSON_RPC};
             return;
         }
         $cjx->incr_parse($qbuffer);

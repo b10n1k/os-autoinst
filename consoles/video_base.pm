@@ -47,7 +47,7 @@ sub type_string ($self, $args) {
         # typical max_interval values are
         #   4ish:  veeery slow
         #   15ish: slow
-        $seconds_per_keypress = $seconds_per_keypress + 1 / sqrt($args->{max_interval});
+        $seconds_per_keypress += 1 / sqrt($args->{max_interval});
     }
 
     for my $letter (split("", $args->{text})) {
@@ -74,9 +74,8 @@ sub mouse_move_to ($self, $x, $y) { }
 
 # those refer to emulated tablet resolution, which (theoretically) might be
 # different than the screen
-sub mouse_width ($self) { return 1024; }
-
-sub mouse_height ($self) { return 768; }
+sub mouse_width ($self) { $self->{backend}->{xres}; }
+sub mouse_height ($self) { $self->{backend}->{yres}; }
 
 sub mouse_absolute ($self) { return 1; }
 

@@ -4,27 +4,23 @@ comment:
   behavior: default
   require_changes: true
 coverage:
-  range: 60..95
+  range: 80..100
   round: down
   precision: 2
   status:
     changes: false
     project:
       default:
-        target: 62.2
+        target: 94.0
         threshold: 0.1
       fully_covered:
         target: 100.0
         paths:
-          - OpenQA/Benchmark
-          - OpenQA/Isotovideo/Interface.pm
-          - OpenQA/Test
-          - OpenQA/Exceptions.pm
-          - backend/amt.pm
-          - backend/null.pm
-          - backend/spvm.pm
-          - backend/vagrant.pm
-          - backend/virt.pm
+          - OpenQA/
+          - backend/
+          - consoles/console.pm
+          - consoles/VMWare.pm
+          - consoles/VNC.pm
           - consoles/localXvnc.pm
           - consoles/network_console.pm
           - consoles/serial_screen.pm
@@ -35,6 +31,8 @@ coverage:
           - mmapi.pm
           - osutils.pm
           - signalblocker.pm
+          - t/
+          - xt/
     patch:
       default:
         branches: null

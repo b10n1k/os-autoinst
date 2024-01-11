@@ -16,12 +16,14 @@ require IPC::System::Simple;
 use autodie ':all';
 
 use commands;
+use OpenQA::Commands;
 use Mojo::IOLoop::Server;
 use Time::HiRes 'sleep';
 use Test::Warnings ':report_warnings';
 use Test::Output;
 use Test::Mojo;
 use Test::MockModule;
+use Test::MockObject;
 use Mojo::File qw(path tempfile tempdir);
 use File::Which;
 use Data::Dumper;
@@ -35,10 +37,9 @@ my $data_dir = $toplevel_dir->child('data');
 
 sub wait_for_server ($ua) {
     for (my $counter = 0; $counter < 20; $counter++) {
-        return if (($ua->get("$base_url/NEVEREVER")->res->code // 0) == 404);
         sleep .1;
+        return if (($ua->get("$base_url/NEVEREVER")->res->code // 0) == 404);
     }
-    return 1;
 }
 
 $bmwqemu::vars{JOBTOKEN} = $job;
@@ -57,18 +58,17 @@ combined_like { ($cserver, $cfd) = commands::start_server($mojoport); } qr//, 'c
 my $spid = fork();
 if ($spid == 0) {
     # we need to fake isotovideo here
-    while (1) {
-        my $json = myjsonrpc::read_json($cfd);
-        my $cmd = delete $json->{cmd};
-        next unless $cmd;
-        myjsonrpc::send_json($cfd, $cmd eq 'version' ? {VERSION => 'COOL'} : {response_for => $cmd, %$json});
+    while (1) {    # uncoverable statement
+        my $json = myjsonrpc::read_json($cfd);    # uncoverable statement
+        next unless my $cmd = delete $json->{cmd};    # uncoverable statement
+        myjsonrpc::send_json($cfd, $cmd eq 'version' ? {VERSION => 'COOL'} : {response_for => $cmd, %$json});    # uncoverable statement
     }
-    _exit(0);
+    _exit(0);    # uncoverable statement
 }
 
 # create test user agent and wait for server
 my $t = Test::Mojo->new;
-exit(0) if wait_for_server($t->ua);
+wait_for_server($t->ua);
 
 ok(chdir $toplevel_dir, "change overall test working directory back to $toplevel_dir");
 
@@ -120,7 +120,7 @@ subtest 'data api (directory download)' => sub {
     $t->get_ok("$base_url/$job/data")->status_is(200)->content_type_is('application/x-cpio');
     my $tmpdir = tempdir;
     my $outfile = path($tmpdir . '/data_full.cpio');
-    $outfile->spurt($t->tx->res->body);
+    $outfile->spew($t->tx->res->body);
     ok(system("cd $tmpdir && cpio -id < data_full.cpio >/dev/null 2>&1") == 0, 'Extract cpio archive');
     ok(-d $tmpdir . '/data/mod1', 'Recursive directory download 1.1');
     ok(-d $tmpdir . '/data/mod1/sub', 'Recursive directory download 1.2');
@@ -135,7 +135,7 @@ subtest 'data api (directory download)' => sub {
     $t->content_type_is("application/x-cpio");
     $tmpdir = tempdir;
     $outfile = path($tmpdir . '/data_full.cpio');
-    $outfile->spurt($t->tx->res->body);
+    $outfile->spew($t->tx->res->body);
     ok(system("cd $tmpdir && cpio -id < data_full.cpio >/dev/null 2>&1") == 0, 'Extract cpio archive');
     ok(-d $tmpdir . '/data/sub', 'Recursive directory download 2.1');
     ok(-f $tmpdir . '/data/test1.txt', 'Recursive directory download 2.2');
@@ -206,6 +206,35 @@ subtest 'upload api' => sub {
 kill TERM => $spid;
 waitpid($spid, 0);
 combined_like { eval { $cserver->stop() } } qr/commands process exited/, 'commands server stopped';
+
+subtest 'decode failure' => sub {
+    my $jsonrpc = Test::MockModule->new('myjsonrpc');
+    # uncoverable statement count:2
+    # uncoverable statement count:3
+    $jsonrpc->redefine(send_json => sub ($iso, $data) { 1 });
+
+    my $oc = Test::MockModule->new('OpenQA::Commands');
+    $oc->redefine(decode_json => sub ($json) { die 23 });
+
+    my $mock_log = Test::MockObject->new({});
+    my (@debug, @warn);
+    $mock_log->mock(debug => sub ($self, $msg) { push @debug, $msg });
+    $mock_log->mock(warn => sub ($self, $msg) { push @warn, $msg });
+
+    my $mock_app = Test::MockObject->new({});
+    $mock_app->mock(log => sub ($self) { $mock_log });
+    $mock_app->mock(defaults => sub ($self, $type) { 1 });
+
+    my $mock = Test::MockObject->new({});
+    $mock->mock(app => sub ($self) { $mock_app });
+
+    my $json = '{"foo":"bar"}';
+    my $ret = OpenQA::Commands::pass_message_from_ws_client_to_isotovideo($mock, 23, $json);
+    is $debug[0], "cmdsrv: passing command from client to isotovideo 1: $json",
+      'debug output like expected';
+    is $warn[0], 'cmdsrv: failed to decode message', 'warn output like expected';
+    is $ret, undef, 'pass_message_from_ws_client_to_isotovideo returns undef';
+};
 
 done_testing;
 

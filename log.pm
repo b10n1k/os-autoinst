@@ -3,7 +3,7 @@
 
 package log;
 
-use Mojo::Base -strict;
+use Mojo::Base -strict, -signatures;
 use Carp;
 use Mojo::File qw(path);
 use Mojo::Log;
@@ -17,59 +17,51 @@ our @EXPORT_OK = qw(logger init_logger diag fctres fctinfo fctwarn modstate);
 our $logger;
 our $direct_output;
 
-sub logger { $logger //= Mojo::Log->new(level => 'debug', format => \&log_format_callback) }
+sub logger () { $logger //= Mojo::Log->new(level => 'debug', format => \&log_format_callback) }
 
-sub init_logger { logger->path(path('testresults', 'autoinst-log.txt')) unless $direct_output }
+sub init_logger () { logger->path(path('testresults', 'autoinst-log.txt')) unless $direct_output }
 
-sub log_format_callback {
-    my ($time, $level, @items) = @_;
-
+sub log_format_callback ($time, $level, @items) {
     my $lines = join("\n", @items, '');
 
     # ensure indentation for multi-line output
     $lines =~ s/(?<!\A)^/  /gm;
 
-    return '[' . Time::Moment->now . "] [$level] $lines";
+    return '[' . Time::Moment->now . "] [$level] [pid:$$] $lines";
 }
 
-sub diag {
-    my ($args) = @_;
-    confess "missing input" unless $args;
+sub diag (@args) {
+    confess "missing input" unless @args;
     logger->append(color('white'));
-    logger->debug(@_)->append(color('reset'));
+    $args[-1] .= color('reset');
+    logger->debug(@args);
     return;
 }
 
-sub fctres {
-    my ($text, $fname) = @_;
-
+sub fctres ($text, $fname = undef) {
     $fname //= (caller(1))[3];
     logger->append(color('green'));
-    logger->debug(">>> $fname: $text")->append(color('reset'));
+    logger->debug(">>> $fname: $text" . color('reset'));
     return;
 }
 
-sub fctinfo {
-    my ($text, $fname) = @_;
-
+sub fctinfo ($text, $fname = undef) {
     $fname //= (caller(1))[3];
     logger->append(color('yellow'));
-    logger->info("::: $fname: $text")->append(color('reset'));
+    logger->info("::: $fname: $text" . color('reset'));
     return;
 }
 
-sub fctwarn {
-    my ($text, $fname) = @_;
-
+sub fctwarn ($text, $fname = undef) {
     $fname //= (caller(1))[3];
     logger->append(color('red'));
-    logger->warn("!!! $fname: $text")->append(color('reset'));
+    logger->warn("!!! $fname: $text" . color('reset'));
     return;
 }
 
-sub modstate {
+sub modstate (@text) {
     logger->append(color('bold blue'));
-    logger->debug("||| @{[join(' ', @_)]}")->append(color('reset'));
+    logger->debug("||| @{[join(' ', @text)]}" . color('reset'));
     return;
 }
 

@@ -12,12 +12,14 @@ use File::Basename;
 use Socket;
 use IO::Handle;
 use POSIX '_exit';
+use Carp qw();
 use cv;
 use signalblocker;
 use Scalar::Util 'blessed';
 use Mojo::IOLoop::ReadWriteProcess 'process';
 use Mojo::IOLoop::ReadWriteProcess::Session 'session';
 use Mojo::File qw(path);
+use File::Glob qw(bsd_glob);
 
 our @EXPORT_OK = qw(loadtest $selected_console $last_milestone_console query_isotovideo);
 
@@ -32,6 +34,11 @@ OS Autoinst decides which test modules to run based on a distribution specific
 script called main.pm. This is either located in $vars{PRODUCTDIR} or
 $vars{CASEDIR} (e.g. <distribution>/products/<product>/main.pm).
 
+Wheels can be used to add functionality from other repositories. If a file
+`wheels.yaml` is present the specified git repositories are cloned before tests
+are run. $vars{WHEELS_DIR} defaults to the working directory of `isotovideo`
+if not set explicitly and determines where wheels are stored.
+
 This script does not actually run the tests, but queues them to be run by
 autotest.pm. A test is queued by calling the loadtest function which is also
 located in autotest.pm. The test modules are executed in the same order that
@@ -40,6 +47,10 @@ loadtest is called.
 =cut
 
 sub find_script ($script) {
+    my $wheels_dir = $bmwqemu::vars{WHEELS_DIR} // Cwd::getcwd;
+    if (defined(my $wheel = bsd_glob "$wheels_dir/*/tests/$script")) {
+        return $wheel;
+    }
     my $casedir = $bmwqemu::vars{CASEDIR};
     my $script_override_path = join('/', $bmwqemu::vars{ASSETDIR} // '', 'other', $script);
     if (-f $script_override_path) {
@@ -85,6 +96,17 @@ e.g. by making use of the openQA asset download feature.
 
 =cut
 
+sub _debug_python_version () {
+    state $python_loaded = 0;
+    return if $python_loaded++;
+    my $code = <<~'EOM';
+    use Inline::Python;
+    return Inline::Python::py_eval('__import__("sys").version', 0);
+    EOM
+    my $debug = eval $code;
+    bmwqemu::diag "Using python version " . $debug;
+}
+
 sub loadtest ($script, %args) {
     no utf8;    # Inline Python fails on utf8, so let's exclude it here
     my $casedir = $bmwqemu::vars{CASEDIR};
@@ -104,14 +126,25 @@ sub loadtest ($script, %args) {
         $code .= "require '$script_path';";
     }
     elsif ($script =~ m/\.py$/) {
+        _debug_python_version();
         # Adding the include path of os-autoinst into python context
         my $inc = File::Basename::dirname(__FILE__);
-        $code .= "
+        my $script_dir = path(File::Basename::dirname($script_path))->to_abs;
+        $code .= <<~"EOM";
             use base 'basetest';
-            use Mojo::File 'path';
-            use Inline Python => 'import sys; sys.path.append(\"$inc\")';
-            use Inline Python => path('$casedir/$script')->slurp;
-            ";
+            use Inline::Python qw(py_eval py_bind_func py_study_package);
+            py_eval(<<'END_OF_PYTHON_CODE');
+            import sys
+            sys.path.append("$inc")
+            sys.path.append("$script_dir")
+            import $name
+            END_OF_PYTHON_CODE
+            # Bind the python functions to the perl $name package
+            my %info = py_study_package("$name");
+            for my \$func (\@{ \$info{functions} }) {
+                py_bind_func("${name}::\$func", "$name", \$func);
+            }
+            EOM
         $is_python = 1;
     }
     eval $code;
@@ -135,6 +168,9 @@ sub loadtest ($script, %args) {
         unless (blessed($args{run_args}) && $args{run_args}->isa('OpenQA::Test::RunArgs')) {
             die 'The run_args must be a sub-class of OpenQA::Test::RunArgs';
         }
+
+        die 'run_args is not supported in Python test modules.' if $is_python;
+
         $test->{run_args} = $args{run_args};
         delete $args{run_args};
     }
@@ -315,6 +351,32 @@ sub query_isotovideo ($cmd, $args = undef) {
     return $rsp->{ret};
 }
 
+sub croak ($command, $error) {
+    # possibly pause and ignore failure …
+    return bmwqemu::diag "ignoring failure via developer mode: $error"
+      if autotest::pause_on_failure("$command failed: $error", $command)->{ignore_failure};
+
+    # … or escalate the failure as usual via croak
+    local $Carp::CarpLevel = 2;    # omit this helper function in the trace
+    Carp::croak $error;
+}
+
+my $failed_command;
+sub pause_on_failure ($reason, $command = undef) {
+    # avoid handling a failing command again (via the die handler) after the test execution has been resumed
+    if (!defined $command && $failed_command) {
+        undef $failed_command;
+        return {};
+    }
+    $failed_command = $command;
+
+    # hang until the user resumes if supposed to pause on failures via developer mode
+    my $rsp = autotest::query_isotovideo(pause_test_execution => {due_to_failure => 1, reason => $reason});
+    $rsp = {} unless ref $rsp eq 'HASH';
+    undef $failed_command if $rsp->{ignore_failure};
+    return $rsp;
+}
+
 sub runalltests () {
     die "ERROR: no tests loaded" unless @testorder;
 
@@ -331,14 +393,7 @@ sub runalltests () {
         my $fullname = $t->{fullname};
 
         if (!$vmloaded && $fullname eq $firsttest) {
-            if ($bmwqemu::vars{SKIPTO}) {
-                if ($bmwqemu::vars{TESTDEBUG}) {
-                    load_snapshot('lastgood');
-                }
-                else {
-                    load_snapshot($firsttest);
-                }
-            }
+            load_snapshot($bmwqemu::vars{TESTDEBUG} ? 'lastgood' : $firsttest) if $bmwqemu::vars{SKIPTO};
             $vmloaded = 1;
         }
         if (!$vmloaded) {
@@ -381,14 +436,14 @@ sub runalltests () {
                 bmwqemu::stop_vm();
                 return 0;
             }
-            elsif (!$flags->{no_rollback} && $last_milestone) {
+            elsif (defined $next_test && !$flags->{no_rollback} && $last_milestone) {
                 load_snapshot('lastgood');
-                $next_test->record_resultfile('Snapshot', "Loaded snapshot because '$name' failed", result => 'ok') if $next_test;
+                $next_test->record_resultfile('Snapshot', "Loaded snapshot because '$name' failed", result => 'ok');
                 $last_milestone->rollback_activated_consoles();
             }
         }
         else {
-            if (!$flags->{no_rollback} && $last_milestone && $flags->{always_rollback}) {
+            if (defined $next_test && !$flags->{no_rollback} && $last_milestone && $flags->{always_rollback}) {
                 load_snapshot('lastgood');
                 $next_test->record_resultfile('Snapshot', "Loaded snapshot after '$name' (always_rollback)", result => 'ok') if $next_test;
                 $last_milestone->rollback_activated_consoles();

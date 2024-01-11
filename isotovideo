@@ -18,20 +18,63 @@ Parses command line parameters, vars.json and tests the given assets/ISOs.
 
 Enable direct output to STDERR instead of autoinst-log.txt
 
+=item B<--workdir=>
+
+isotovideo will chdir to that directory on startup
+
+=item B<--color=[yes|no]>
+
+Enable or disable color output explicitly. Defaults to "yes". Alternatively
+ANSI_COLORS_DISABLED or NO_COLOR can be set to any value to disable colors.
+
 =item B<-v, --version>
 
 Show the current program version and test API version
+
+=item B<-e, -?, --exit-status-from-test-results>
+
+isotovideo will exit with status 1 when a test module fails.
 
 =item B<-h, -?, --help>
 
 Show this help.
 
-=head1 TEST PARAMETER
+=back
+
+=head1 TEST PARAMETERS
 
 All additional command line arguments specified in the C<key=value> format are
 parsed as test parameters which take precedence over the settings in the
 vars.json file. Lower case key names are transformed into upper case
 automatically for convenience.
+
+=head1 EXIT CODES
+
+=over 4
+
+=item B<0 - SUCCESS>
+
+isotovideo successfully executed a complete run. In the case of C<--exit-status-from-test-results> flag additionally all test modules passed or softfailed.
+
+=item B<1 - ERROR>
+
+An error ocurred during the test execution related to a test backend failure.
+
+=item B<100 - NO TEST MODULES SCHEDULED>
+
+No test module was scheduled.
+
+This exit code can only be reported when invoked with the
+C<--exit-status-from-test-results> flag.
+
+=item B<101 - TEST MODULES FAILED>
+
+At least one test module did not end with result "ok" or "softfail".
+
+This exit code can only be reported when invoked with the
+C<--exit-status-from-test-results> flag.
+
+=back
 
 =cut
 
@@ -39,12 +82,18 @@ use Mojo::Base -strict, -signatures;
 use autodie ':all';
 no autodie 'kill';
 
+use constant {
+    EXIT_STATUS_OK => 0,
+    EXIT_STATUS_ERR => 1,
+    EXIT_STATUS_ERR_NO_TESTS => 100,
+    EXIT_STATUS_ERR_FROM_TEST_RESULTS => 101,
+};
+
 # Avoid "Subroutine JSON::PP::Boolean::(0+ redefined" warnings
 # Details: https://progress.opensuse.org/issues/90371
 use JSON::PP;
 
 my $installprefix;    # $bmwqemu::scriptdir
-my $fatal_error;    # the last error message caught by the die handler
 
 BEGIN {
     # the following line is modified during make install
@@ -56,165 +105,72 @@ BEGIN {
     unshift @INC, "$installprefix";
 }
 
-use backend::driver;
-use bmwqemu qw(diag fctwarn);
-use needle;
-use autotest ();
-use commands;
-use distribution;
-use testapi ();
-use File::Basename;
+use log qw(diag);
 use Getopt::Long;
-require IPC::System::Simple;
-use POSIX qw(:sys_wait_h _exit);
-use Time::HiRes qw(gettimeofday tv_interval sleep time);
-use Try::Tiny;
-use File::Path;
-use Mojo::UserAgent;
-use Mojo::IOLoop::ReadWriteProcess 'process';
+use Mojo::File qw(curfile);
 use Mojo::IOLoop::ReadWriteProcess::Session 'session';
 Getopt::Long::Configure("no_ignore_case");
-use OpenQA::Isotovideo::CommandHandler;
 use OpenQA::Isotovideo::Interface;
-use OpenQA::Isotovideo::Utils qw(checkout_git_repo_and_branch
-  checkout_git_refspec handle_generated_assets load_test_schedule);
-
-session->enable;
-session->enable_subreaper;
+use OpenQA::Isotovideo::Runner;
+use OpenQA::Isotovideo::Utils qw(git_rev_parse spawn_debuggers handle_generated_assets);
+use Mojo::File qw(path);
 
 my %options;
 
+# global exit status
+my $RETURN_CODE = EXIT_STATUS_ERR;
+
 sub usage ($r) {
+    $RETURN_CODE = $r;
     eval { require Pod::Usage; Pod::Usage::pod2usage($r) };
     die "cannot display help, install perl(Pod::Usage)\n" if $@;
 }
 
-sub _get_version_string {
-    my $dirname = dirname(__FILE__);
-    my $thisversion = qx{git -C $dirname rev-parse HEAD};
-    chomp $thisversion;
-    die 'Could not parse version' unless $thisversion;
+sub _get_version_string () {
+    my $thisversion = git_rev_parse(curfile->dirname);
     return "Current version is $thisversion [interface v$OpenQA::Isotovideo::Interface::version]";
 }
 
-sub version {
+sub _exit_code_from_test_results () {
+    my @results = glob(path(bmwqemu::result_dir(), "result-*.json"));
+    return EXIT_STATUS_ERR_NO_TESTS if @results == 0;
+
+    my $did_fail = 0;
+    for my $result_file_path (@results) {
+        my $result_file = path($result_file_path);
+        my $test_result = decode_json($result_file->slurp)->{result};
+        diag sprintf("Test result [%s] %s", $result_file->to_string, $test_result);
+        # If a failure (anything different from ok & softfail) is found, keep it.
+        next if $did_fail;
+
+        $did_fail = $test_result !~ m/^(ok|softfail)$/;
+    }
+    return $did_fail ? EXIT_STATUS_ERR_FROM_TEST_RESULTS : EXIT_STATUS_OK;
+}
+
+sub version () {
     print _get_version_string() . "\n";
+    $RETURN_CODE = EXIT_STATUS_OK;
     exit 0;
 }
 
-GetOptions(\%options, 'debug|d', 'help|h|?', 'version|v') or usage(1);
+GetOptions(\%options, 'debug|d', 'workdir=s', 'color=s', 'help|h|?', 'version|v', 'exit-status-from-test-results|e') or usage(1);
 usage(0) if $options{help};
 version() if $options{version};
 
-# global exit status
-my $return_code = 1;
+session->enable;
+session->enable_subreaper;
 
-# record the last die message
-# note: It might *not* be a fatal error so we don't call bmwqemu::serialize_state here
-#       immediately but only in the END block.
-$SIG{__DIE__} = sub { $fatal_error = shift };
+my $color = $options{color} // 'yes';
+# User setting has preference, see https://no-color.org/
+delete $ENV{NO_COLOR} if $color eq 'yes';
+# Term::ANSIColor honors this variable
+$ENV{ANSI_COLORS_DISABLED} = 1 if $color eq 'no';
 
-diag(_get_version_string());
+chdir $options{workdir} if $options{workdir};
 
-# enable debug default when started from a tty
-$log::direct_output = $options{debug};
-
-select(STDERR);
-$| = 1;
-select(STDOUT);    # default
-$| = 1;
-
-$bmwqemu::scriptdir = $installprefix;
-bmwqemu::init();
-for my $arg (@ARGV) {
-    if ($arg =~ /^([[:alnum:]_\[\]\.]+)=(.+)/) {
-        my $key = uc $1;
-        $bmwqemu::vars{$key} = $2;
-        diag("Setting forced test parameter $key -> $2");
-    }
-}
-
-my $cmd_srv_process;
-my $command_handler;
-my $testprocess;
-my $cmd_srv_fd;
-my $cmd_srv_port;
-my $backend_process;
-my $loop = 1;
-
-# note: The subsequently defined stop_* functions are used to tear down the process tree.
-#       However, the worker also ensures that all processes are being terminated (and
-#       eventually killed).
-
-sub stop_commands {
-    my ($reason) = @_;
-    return unless defined $cmd_srv_process;
-    return unless $cmd_srv_process->is_running;
-
-    my $pid = $cmd_srv_process->pid;
-    diag("stopping command server $pid because $reason");
-
-    if ($cmd_srv_port && $reason && $reason eq 'test execution ended') {
-        my $job_token = $bmwqemu::vars{JOBTOKEN};
-        my $url = "http://127.0.0.1:$cmd_srv_port/$job_token/broadcast";
-        diag('isotovideo: informing websocket clients before stopping command server: ' . $url);
-
-        # note: If the job is stopped by the worker because it has been
-        # aborted, the worker will send this command on its own to the command
-        # server and also stop the command server. So this is only done in the
-        # case the test execution just ends.
-
-        my $timeout = 15;
-        # The command server might have already been stopped by the worker
-        # after the user has aborted the job or the job timeout has been
-        # exceeded so no checks for failure done.
-        Mojo::UserAgent->new(request_timeout => $timeout)->post($url, json => {stopping_test_execution => $reason});
-    }
-
-    $cmd_srv_process->stop();
-    $cmd_srv_process = undef;
-    diag('done with command server');
-}
-
-sub stop_autotest {
-    return unless defined $testprocess;
-
-    diag('stopping autotest process ' . $testprocess->pid);
-    $testprocess->stop() if $testprocess->is_running;
-    $testprocess = undef;
-    diag('done with autotest process');
-}
-
-sub stop_backend {
-    return unless defined $bmwqemu::backend && $backend_process;
-
-    diag('stopping backend process ' . $backend_process->pid);
-    $backend_process->stop if $backend_process->is_running;
-    $backend_process = undef;
-    diag('done with backend process');
-}
-
-sub signalhandler {
-    my ($sig) = @_;
-    bmwqemu::serialize_state(component => 'isotovideo', msg => "isotovideo received signal $sig", log => 1);
-    return $loop = 0 if $loop;
-    stop_backend;
-    stop_commands("received signal $sig");
-    stop_autotest;
-    _exit(1);
-}
-
-sub init_backend {
-    my ($name) = @_;
-
-    $bmwqemu::vars{BACKEND} ||= "qemu";
-    $bmwqemu::backend = backend::driver->new($bmwqemu::vars{BACKEND});
-    return $bmwqemu::backend;
-}
-
-$SIG{TERM} = \&signalhandler;
-$SIG{INT} = \&signalhandler;
-$SIG{HUP} = \&signalhandler;
+# abstraction providing many helpers and function to run the select-loop
+my $runner;
 
 # make sure all commands coming from the backend will not be in the
 # developers's locale - but a defined english one. This is SUSE's
@@ -222,203 +178,64 @@ $SIG{HUP} = \&signalhandler;
 $ENV{LC_ALL} = 'en_US.UTF-8';
 $ENV{LANG} = 'en_US.UTF-8';
 
-checkout_git_repo_and_branch('CASEDIR');
+eval {
+    diag(_get_version_string());
 
-# Try to load the main.pm from one of the following in this order:
-#  - product dir
-#  - casedir
-#
-# This allows further structuring the test distribution collections with
-# multiple distributions or flavors in one repository.
-$bmwqemu::vars{PRODUCTDIR} ||= $bmwqemu::vars{CASEDIR};
+    # enable debug default when started from a tty
+    $log::direct_output = $options{debug};
 
-# checkout Git repo NEEDLES_DIR refers to (if it is a URL) and re-assign NEEDLES_DIR to contain the checkout path
-checkout_git_repo_and_branch('NEEDLES_DIR');
+    $bmwqemu::scriptdir = $installprefix;
 
-bmwqemu::ensure_valid_vars();
+    $runner = OpenQA::Isotovideo::Runner->new;
+    $runner->_init_bmwqemu(@ARGV);
+    $runner->prepare;
+    $runner->start_autotest;
+    $runner->create_backend;
 
-# as we are about to load the test modules checkout the specified git refspec,
-# if specified, or simply store the git hash that has been used. If it is not a
-# git repo fail silently, i.e. store an empty variable
+    spawn_debuggers;
 
-$bmwqemu::vars{TEST_GIT_HASH} = checkout_git_refspec($bmwqemu::vars{CASEDIR} => 'TEST_GIT_REFSPEC');
+    $runner->handle_commands;
 
-# set a default distribution if the tests don't have one
-$testapi::distri = distribution->new;
+    $RETURN_CODE = EXIT_STATUS_OK;
 
-load_test_schedule;
+    # enter the main loop: process messages from autotest, command server and backend
+    $runner->run;
 
-# start the command fork before we get into the backend, the command child
-# is not supposed to talk to the backend directly
-($cmd_srv_process, $cmd_srv_fd) = commands::start_server($cmd_srv_port = $bmwqemu::vars{QEMUPORT} + 1);
+    if ($options{'exit-status-from-test-results'}) {
+        $RETURN_CODE = _exit_code_from_test_results();
+    }
 
-testapi::init();
-needle::init();
-bmwqemu::save_vars();
+    # terminate/kill the command server and let it inform its websocket clients before
+    $runner->stop_commands('test execution ended');
 
-my $testfd;
-($testprocess, $testfd) = autotest::start_process();
+    if ($runner->testfd) {
+        # unusual shutdown
+        $RETURN_CODE = EXIT_STATUS_ERR;    # uncoverable statement
+        CORE::close $runner->testfd;    # uncoverable statement
+        $runner->stop_autotest();    # uncoverable statement
+    }
 
-init_backend();
+    diag 'isotovideo ' . ($RETURN_CODE ? 'failed' : 'done');
+    my $clean_shutdown = $runner->handle_shutdown(\$RETURN_CODE);
 
-open(my $fd, ">", "os-autoinst.pid");
-print $fd "$$\n";
-close $fd;
+    # read calculated variables from backend and tests
+    bmwqemu::load_vars();
 
-if (!$bmwqemu::backend->_send_json({cmd => 'alive'})) {
-    # might throw an exception
-    $bmwqemu::backend->start_vm();
+    $RETURN_CODE = handle_generated_assets($runner->command_handler, $clean_shutdown) unless $RETURN_CODE;
+};
+if (my $error = $@) {
+    log::fctwarn $error, 'main';
+    bmwqemu::serialize_state(component => 'isotovideo', msg => $error);
 }
-
-# launch debugging tools
-my %debugging_tools;
-$debugging_tools{vncviewer} = ['vncviewer', '-viewonly', '-shared', "localhost:$bmwqemu::vars{VNC}"] if $ENV{RUN_VNCVIEWER};
-$debugging_tools{debugviewer} = ["$bmwqemu::scriptdir/debugviewer/debugviewer", 'qemuscreenshot/last.png'] if $ENV{RUN_DEBUGVIEWER};
-for my $tool (keys %debugging_tools) {
-    next if fork() != 0;
-    no autodie 'exec';
-    { exec(@{$debugging_tools{$tool}}) };
-    exit -1;    # don't continue in any case (exec returns if it fails to spawn the process printing an error message on its own)
-}
-
-use IO::Select;
-
-$backend_process = $bmwqemu::backend->{backend_process};
-my $io_select = IO::Select->new();
-$io_select->add($testfd);
-$io_select->add($cmd_srv_fd);
-$io_select->add($backend_process->channel_out);
-
-# stop main loop as soon as one of the child processes terminates
-my $stop_loop = sub { $loop = 0 if $loop; };
-$testprocess->once(collected => $stop_loop);
-$backend_process->once(collected => $stop_loop);
-$cmd_srv_process->once(collected => $stop_loop);
-
-# now we have everything, give the tests a go
-$testfd->write("GO\n");
-
-$command_handler = OpenQA::Isotovideo::CommandHandler->new(
-    cmd_srv_fd => $cmd_srv_fd,
-    backend_fd => $backend_process->channel_in,
-);
-$command_handler->on(tests_done => sub {
-        CORE::close($testfd);
-        $testfd = undef;
-        stop_autotest;
-        $loop = 0;
-});
-
-my ($last_check_seconds, $last_check_microseconds) = gettimeofday;
-sub _calc_check_delta {
-    # an estimate of eternity
-    my $delta = 100;
-    if ($last_check_seconds) {
-        $delta = tv_interval([$last_check_seconds, $last_check_microseconds], [gettimeofday]);
-    }
-    # sleep the remains of one second if $delta > 0
-    my $timeout = $delta > 0 ? 1 - $delta : 0;
-    $command_handler->timeout($timeout < 0 ? 0 : $timeout);
-    return $delta;
-}
-
-sub check_asserted_screen {
-    my $no_wait = shift;
-
-    if ($no_wait) {
-        # prevent CPU overload by waiting at least a little bit
-        $command_handler->timeout(0.1);
-    }
-    else {
-        _calc_check_delta;
-        # come back later, avoid too often called function
-        return if $command_handler->timeout > 0.05;
-    }
-    ($last_check_seconds, $last_check_microseconds) = gettimeofday;
-    my $rsp = $bmwqemu::backend->_send_json({cmd => 'check_asserted_screen'}) || {};
-    # the test needs that information
-    $rsp->{tags} = $command_handler->tags;
-    if ($rsp->{found} || $rsp->{timeout}) {
-        myjsonrpc::send_json($testfd, {ret => $rsp});
-        $command_handler->clear_tags_and_timeout();
-    }
-    else {
-        _calc_check_delta unless $no_wait;
-    }
-}
-
-$return_code = 0;
-
-# enter the main loop: process messages from autotest, command server and backend
-while ($loop) {
-    my ($ready_for_read, $ready_for_write, $exceptions) = IO::Select::select($io_select, undef, $io_select, $command_handler->timeout);
-    for my $readable (@$ready_for_read) {
-        my $rsp = myjsonrpc::read_json($readable);
-        if (!defined $rsp) {
-            fctwarn sprintf("THERE IS NOTHING TO READ %d %d %d", fileno($readable), fileno($testfd), fileno($cmd_srv_fd));
-            $readable = 1;
-            $loop = 0;
-            last;
-        }
-        if ($readable == $backend_process->channel_out) {
-            $command_handler->send_to_backend_requester({ret => $rsp->{rsp}});
-            next;
-        }
-        $command_handler->process_command($readable, $rsp);
-    }
-    if (defined($command_handler->tags)) {
-        check_asserted_screen($command_handler->no_wait);
-    }
-}
-
-# tell the command server that it should no longer process isotovideo commands since we've
-# just left the loop which would handle such commands (otherwise the command server would just
-# hang on the next isotovideo command)
-$command_handler->stop_command_processing;
-
-# terminate/kill the command server and let it inform its websocket clients before
-stop_commands('test execution ended');
-
-if ($testfd) {
-    $return_code = 1;    # unusual shutdown
-    CORE::close $testfd;
-    stop_autotest;
-}
-
-diag 'isotovideo ' . ($return_code ? 'failed' : 'done');
-
-my $clean_shutdown;
-if (!$return_code) {
-    eval {
-        $clean_shutdown = $bmwqemu::backend->_send_json({cmd => 'is_shutdown'});
-        diag('backend shutdown state: ' . ($clean_shutdown // '?'));
-    };
-
-    # don't rely on the backend in a sane state if we failed - just stop it later
-    eval { bmwqemu::stop_vm(); };
-    if ($@) {
-        bmwqemu::serialize_state(component => 'backend', msg => "unable to stop VM: $@", error => 1);
-        $return_code = 1;
-    }
-}
-
-# read calculated variables from backend and tests
-bmwqemu::load_vars();
-
-$return_code = handle_generated_assets($command_handler, $clean_shutdown) unless $return_code;
-
-# clear any previously recorded die message; it was not fatal after all if the execution came this far
-$fatal_error = undef;
 
 END {
-    stop_backend;
-    stop_commands('test execution ended through exception');
-    stop_autotest;
+    $runner->backend->stop if $runner and $runner->backend;
+    $runner and $runner->stop_commands('test execution ended through exception');
+    $runner and $runner->stop_autotest();
 
     # in case of early exit, e.g. help display
-    $return_code //= 0;
+    $RETURN_CODE //= 0;
 
-    bmwqemu::serialize_state(component => 'isotovideo', msg => $fatal_error) if $fatal_error;
-    print "$$: EXIT $return_code\n";
-    $? = $return_code;
+    print "$$: EXIT $RETURN_CODE\n";
+    $? = $RETURN_CODE;
 }

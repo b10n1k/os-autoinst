@@ -30,7 +30,7 @@ eval set -- "$opts"
 while true; do
   case "$1" in
     -v | --verbose ) set -x; shift ;;
-    -h | --help ) usage 0; shift ;;
+    -h | --help ) usage 0 ;;
     -t | --target ) target="$2"; shift 2 ;;
     -- ) shift; break ;;
     * ) break ;;
@@ -39,7 +39,7 @@ done
 
 CI_ENV=$(bash <(curl -s https://codecov.io/env))
 
-IMAGE=registry.opensuse.org/devel/openqa/containers15.3/os-autoinst_dev
+IMAGE=registry.opensuse.org/devel/openqa/containers/os-autoinst_dev
 build_dir="${build_dir:-"build"}"  # default is in accordance with file path in `.github/workflows/ci.yml`
 cre="${cre:-"podman"}"
 $cre pull $IMAGE
@@ -47,7 +47,7 @@ $cre images | grep opensuse
 
 # shellcheck disable=SC2086
 $cre run --env "QEMU_QMP_CONNECT_ATTEMPTS=10" \
-  $CI_ENV --rm --entrypoint '' -v "$PWD":/opt $IMAGE sh -ec "
+  $CI_ENV --rm --entrypoint '' -v "$PWD":/opt $IMAGE bash -ec "
 . /etc/os-release
 if [[ \"$cre\" == \"docker\" && \"$ID\" == \"opensuse-leap\" ]]; then
     echo 'Newer docker versions need a patched qemu with disabled membarrier'
@@ -55,10 +55,14 @@ if [[ \"$cre\" == \"docker\" && \"$ID\" == \"opensuse-leap\" ]]; then
     zypper -n --gpg-auto-import-keys --no-gpg-checks refresh
     zypper -n in --from qemu qemu qemu-x86 qemu-tools qemu-ipxe qemu-sgabios qemu-seabios
 fi
-[[ \"$target\" == \"coverage-codecovbash\" ]] && zypper -n in perl-App-cpanminus && cpanm -nq 'Devel::Cover::Report::Codecovbash'
+if [[ \"$target\" == \"coverage-codecovbash\" ]]; then
+	zypper -n in perl-App-cpanminus
+	cpanm -nq 'Devel::Cover::Report::Codecovbash'
+fi
 cd /opt
 ./tools/install-new-deps.sh
-export CI=1 WITH_COVER_OPTIONS=1 CHECK_GIT_STATUS=1
+export CI=1 WITH_COVER_OPTIONS=1 CHECK_GIT_STATUS=1 PERL_TEST_WARNINGS_ONLY_REPORT_WARNINGS=$PERL_TEST_WARNINGS_ONLY_REPORT_WARNINGS
 cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -S . -B \"$build_dir\"
 cmake --build \"$build_dir\" --verbose --target check
-cmake --build \"$build_dir\" --verbose --target $target"
+cmake --build \"$build_dir\" --verbose --target $target
+cover -report html_minimal \"$build_dir\"/cover_db"

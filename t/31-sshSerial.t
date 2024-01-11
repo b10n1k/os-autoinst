@@ -49,7 +49,9 @@ $mock_channel->mock(blocking => sub ($self, $arg = undef) {
         return $self->{blocking};
 });
 
-$mock_channel->mock(read => sub ($self, $, $size) {
+$mock_channel->mock(read => sub {    # no:style:signatures
+        my ($self, undef, $size) = @_;
+
         my $data = shift @{$self->{read_queue}};
 
         if (!defined($data)) {
@@ -58,10 +60,15 @@ $mock_channel->mock(read => sub ($self, $, $size) {
         }
 
         if (length($data) > $size) {
+            # uncoverable statement count:1
+            # uncoverable statement count:2
             unshift @{$self->{read_queue}}, substr($data, $size);
-            $data = substr($data, 0, $size);
+            $data = substr($data, 0, $size);    # uncoverable statement
         }
 
+        # this is why we can't use a signature for this function,
+        # assigning to @_ in a function with signature triggers a
+        # warning
         $_[1] = $data;
         return length($data);
 });
@@ -83,10 +90,13 @@ $mock_ssh->set_always(blocking => $mock_channel->blocking($_[1]));
 
 $mock_ssh->mock(error => sub ($self) {
         return undef unless defined($self->{error});
-        return ${$self->{error}}[0] if ((caller(0))[5]);
+        return ${$self->{error}}[0] unless ((caller(0))[5]);
+        # uncoverable statement count:1
+        # uncoverable statement count:2
         return @{$self->{error}};
 });
 
+# uncoverable statement count:2
 $mock_ssh->mock(die_with_error => sub { die $_[1] });
 
 subtest 'Read test' => sub {

@@ -1,9 +1,10 @@
 # Copyright 2009-2013 Bernhard M. Wiedemann
-# Copyright 2012-2020 SUSE LLC
+# Copyright 2012-2023 SUSE LLC
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 package backend::svirt;
 use Mojo::Base 'backend::virt', -signatures;
+use Mojo::File qw(path);
 use File::Basename;
 use IO::Scalar;
 use Time::HiRes 'usleep';
@@ -12,11 +13,16 @@ use bmwqemu;
 use constant SERIAL_CONSOLE_DEFAULT_PORT => 0;
 use constant SERIAL_CONSOLE_DEFAULT_DEVICE => 'console';
 
+# root-sut-serial (ssh-virtsh-serial for root)
 use constant SERIAL_TERMINAL_DEFAULT_PORT => 1;
 use constant SERIAL_TERMINAL_DEFAULT_DEVICE => 'console';
 
+# user-sut-serial (ssh-virtsh-serial for user)
+use constant SERIAL_USER_TERMINAL_DEFAULT_PORT => 2;
+use constant SERIAL_USER_TERMINAL_DEFAULT_DEVICE => 'console';
+
 use Exporter 'import';
-our @EXPORT_OK = qw(SERIAL_CONSOLE_DEFAULT_PORT SERIAL_CONSOLE_DEFAULT_DEVICE SERIAL_TERMINAL_DEFAULT_PORT SERIAL_TERMINAL_DEFAULT_DEVICE);
+our @EXPORT_OK = qw(SERIAL_CONSOLE_DEFAULT_PORT SERIAL_CONSOLE_DEFAULT_DEVICE SERIAL_TERMINAL_DEFAULT_PORT SERIAL_TERMINAL_DEFAULT_DEVICE SERIAL_USER_TERMINAL_DEFAULT_PORT SERIAL_USER_TERMINAL_DEFAULT_DEVICE);
 
 # this is a fake backend to some extend. We don't start VMs, but provide ssh access
 # to a libvirt running host (KVM for System Z in mind)
@@ -85,27 +91,20 @@ sub do_stop_vm ($self, @) {
 
 # Log stdout and stderr and return them in a list (comped).
 sub scp_get ($self, $src, $dest) {
-    bmwqemu::log_call(@_);
+    bmwqemu::log_call($self, $src, $dest);
 
     my %credentials = $self->get_ssh_credentials(_is_hyperv ? 'hyperv' : 'default');
     my $ssh = $self->new_ssh_connection(%credentials);
 
-    open(my $fh, '>', $dest) or die "Could not open file '$dest' $!";
     bmwqemu::diag("SCP file: '$src' => '$dest'");
     my $output = IO::Scalar->new;
     $ssh->scp_get($src, $output) or die "SCP failed";
-    print $fh $output;
-    close $fh;
+    path($dest)->spew($output);
     $ssh->disconnect();
 }
 
 sub can_handle ($self, $args) {
-    my $vars = \%bmwqemu::vars;
-    if ($args->{function} eq 'snapshots' && !$bmwqemu::vars{HDDFORMAT} eq 'raw') {
-        # Snapshots via libvirt are supported on KVM and, perhaps, ESXi. Hyper-V uses native tools.
-        return {ret => 1} if _vmm_family() =~ qr/kvm|hyperv|vmware/;
-    }
-    return;
+    $args->{function} eq 'snapshots' && _vmm_family =~ qr/kvm|hyperv|vmware/ ? {ret => 1} : undef;
 }
 
 sub is_shutdown ($self, @) {
@@ -136,7 +135,7 @@ sub save_snapshot ($self, $args) {
         $rsp = $self->run_ssh_cmd("virsh $libvirt_connector snapshot-create-as $vmname $snapname");
     }
     bmwqemu::diag "SAVE VM $vmname as $snapname snapshot, return code=$rsp";
-    $self->die unless ($rsp == 0);
+    $self->die if $rsp;
     return;
 }
 
@@ -172,25 +171,24 @@ sub load_snapshot ($self, $args) {
 }
 
 sub get_ssh_credentials ($self, $domain = 'default') {
-    unless ($self->{ssh_credentials}) {
-        $self->{ssh_credentials} = {
+    my $ssh_credentials = $self->{ssh_credentials};
+    unless ($ssh_credentials) {
+        $ssh_credentials = $self->{ssh_credentials} = {
             default => {
                 hostname => $bmwqemu::vars{VIRSH_HOSTNAME} || die('Need variable VIRSH_HOSTNAME'),
                 username => $bmwqemu::vars{VIRSH_USERNAME} // 'root',
                 password => $bmwqemu::vars{VIRSH_PASSWORD} || die('Need variable VIRSH_PASSWORD'),
             }
         };
-        if (_is_hyperv) {
-            # Credentials for hyperv intermediary host
-            $self->{ssh_credentials}->{hyperv} = {
-                hostname => $bmwqemu::vars{VIRSH_GUEST} || die('Need variable VIRSH_GUEST'),
-                password => $bmwqemu::vars{VIRSH_GUEST_PASSWORD} || die('Need variable VIRSH_GUEST_PASSWORD'),
-                username => 'root',
-            };
-        }
+        # read/require credentials for Hyper-V intermediary host
+        $ssh_credentials->{hyperv} = {
+            hostname => $bmwqemu::vars{VIRSH_GUEST} || die('Need variable VIRSH_GUEST'),
+            password => $bmwqemu::vars{VIRSH_GUEST_PASSWORD} || die('Need variable VIRSH_GUEST_PASSWORD'),
+            username => 'root',
+        } if _is_hyperv;
     }
-    die("Missing SSH credentials domain '$domain'") unless ($self->{ssh_credentials}->{$domain});
-    return %{$self->{ssh_credentials}->{$domain}};
+    die "Missing ssh credentials domain '$domain'" unless my $c = $ssh_credentials->{$domain};
+    return %$c;
 }
 
 sub start_serial_grab ($self, $name) {
@@ -297,7 +295,7 @@ sub serial_terminal_log_file ($self) {
     return '/tmp/' . SERIAL_TERMINAL_LOG_PATH . '.' . $bmwqemu::vars{JOBTOKEN};
 }
 
-sub check_socket ($self, $fh, $write = undef) { $self->check_ssh_serial($fh, $write) || $self->SUPER::check_socket($fh, $write) }
+sub check_socket ($self, $fh, $write = undef) { $self->check_ssh_serial($fh, $write) || $self->SUPER::check_socket($fh, $write) }    # uncoverable statement
 
 sub stop_serial_grab ($self, @) {
     $self->stop_ssh_serial;

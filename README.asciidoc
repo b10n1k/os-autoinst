@@ -136,6 +136,10 @@ link:https://github.com/os-autoinst/os-autoinst-distri-opensuse/blob/master/vari
 Then you can run the `isotovideo` script within the created working directory. When doing
 a manual build, that script can be found at the top-level of the os-autoinst Git checkout.
 
+All of these examples were using the QEMU backend which is usually the easiest backend
+to handle and therefore recommended. If you need to develop and test other backends, have
+a look at the link:doc/backends.md[backend-specific documentation].
+
 When using the QEMU backend it is possible to access the system under test via VNC:
 
 ----------------------------------------
@@ -339,6 +343,18 @@ enough, `match` will be `null`.
 
 To use the script the previously shown build instructions need to be executed
 (including the invocation of the `symlinks` target).
+
+== History of os-autoinst
+
+At a time Bernhard M. Wiedemann who later joined was on the openSUSE testing
+team and was assigned the task of testing the installer. Which meant tedious
+and dull work of waiting for 4GB ISO files to download when it's not even
+clear if those things even boot. And as the Perl founder Larry Wall states,
+important traits of programmers are lazyness, impatience and hybris. Which
+quickly led to developing os-autoinst to automate installations ;) See
+https://lizards.opensuse.org/2010/04/29/making-of-the-opensuse-install-video/
+and https://lizards.opensuse.org/2010/05/25/automated-opensuse-testing/ for
+Bernhard's blog posts.
 
 == Further notes
 

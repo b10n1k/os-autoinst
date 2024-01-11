@@ -1,5 +1,5 @@
+cmake_minimum_required(VERSION 3.17.0)
 project(os-autoinst CXX)
-cmake_minimum_required(VERSION 3.3.0)
 
 # list non-C++ source files
 set(DOC_FILES
@@ -16,11 +16,9 @@ set(PERL_FILES
     backend/console_proxy.pm
     backend/driver.pm
     backend/generalhw.pm
-    backend/ikvm.pm
     backend/ipmi.pm
     backend/null.pm
     backend/pvm_hmc.pm
-    backend/pvm.pm
     backend/qemu.pm
     backend/s390x.pm
     backend/spvm.pm
@@ -51,6 +49,7 @@ set(PERL_FILES
     consoles/virtio_terminal.pm
     consoles/vnc_base.pm
     consoles/VNC.pm
+    consoles/VMWare.pm
     distribution.pm
     lockapi.pm
     log.pm
@@ -61,9 +60,11 @@ set(PERL_FILES
     OpenQA/Benchmark/Stopwatch.pm
     OpenQA/Commands.pm
     OpenQA/Exceptions.pm
+    OpenQA/Isotovideo/Backend.pm
     OpenQA/Isotovideo/CommandHandler.pm
     OpenQA/Isotovideo/Interface.pm
     OpenQA/Isotovideo/NeedleDownloader.pm
+    OpenQA/Isotovideo/Runner.pm
     OpenQA/Isotovideo/Utils.pm
     OpenQA/NamedIOSelect.pm
     OpenQA/Qemu/BlockDevConf.pm
@@ -89,6 +90,9 @@ set(MISC_FILES
     dmidata/dell_e6330/smbios_type_1.bin
     dmidata/dell_e6330/smbios_type_2.bin
     dmidata/dell_e6330/smbios_type_3.bin
+    dmidata/hp_elitebook_820g1/smbios_type_1.bin
+    dmidata/hp_elitebook_820g1/smbios_type_2.bin
+    dmidata/hp_elitebook_820g1/smbios_type_3.bin
     dmidata/dump
 )
 
@@ -147,6 +151,18 @@ add_custom_target(
 add_dependencies(symlinks videoencoder snd2png debugviewer tinycv)
 
 # create installable versions of isotovideo and cv.pm
+set(OS_AUTOINST_VERSION "" CACHE STRING "os-autoinst version to set for the installation")
+find_program(GIT_BIN git)
+if (OS_AUTOINST_VERSION)
+    set(OS_AUTOINST_VERSION_REPLACE "${OS_AUTOINST_VERSION}")
+elseif (GIT_BIN AND IS_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/.git")
+    execute_process(COMMAND "${GIT_BIN}" rev-parse HEAD
+                    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+                    OUTPUT_VARIABLE OS_AUTOINST_VERSION_REPLACE)
+    string(REPLACE "\n" "" OS_AUTOINST_VERSION_REPLACE "${OS_AUTOINST_VERSION_REPLACE}")
+else ()
+    set(OS_AUTOINST_VERSION_REPLACE "unknown")
+endif ()
 add_custom_command(
     COMMENT "Make directory to store intermediate files for install target"
     COMMAND mkdir -p "${CMAKE_CURRENT_BINARY_DIR}/install-target"
@@ -156,6 +172,7 @@ add_custom_command(
     COMMENT "Make install version of isotovideo"
     COMMAND
         sed -e "\"s,\\$$installprefix = undef\;,\\$$installprefix = '${CMAKE_INSTALL_PREFIX}/${OS_AUTOINST_DATA_DIR}'\;,\""
+            -e "\"s,my \\$$thisversion = \\(.*\\);,my \\$$thisversion = '${OS_AUTOINST_VERSION_REPLACE}';,\""
         "${CMAKE_CURRENT_SOURCE_DIR}/isotovideo" > "${CMAKE_CURRENT_BINARY_DIR}/install-target/isotovideo"
     DEPENDS "isotovideo" "CMakeLists.txt" "${CMAKE_CURRENT_BINARY_DIR}/install-target"
     OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/install-target/isotovideo"
@@ -188,6 +205,7 @@ foreach (FILE ${PERL_FILES} ${MISC_FILES})
     install(FILES "${FILE}" DESTINATION "${OS_AUTOINST_DATA_DIR}/${SUB_DIR}")
 endforeach ()
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/install-target/cv.pm" DESTINATION "${OS_AUTOINST_DATA_DIR}")
+install(FILES "schema/Wheels-01.yaml" DESTINATION "${OS_AUTOINST_DATA_DIR}/schema")
 
 # install openvswitch files
 install(
@@ -197,16 +215,24 @@ install(
     COMPONENT "openvswitch" EXCLUDE_FROM_ALL
 )
 install(
+    FILES "script/os-autoinst-setup-multi-machine"
+    DESTINATION "${CMAKE_INSTALL_BINDIR}"
+    PERMISSIONS ${EXECUTABLE_PERMISSIONS}
+    COMPONENT "openvswitch" EXCLUDE_FROM_ALL
+)
+install(
     FILES "etc/dbus-1/system.d/org.opensuse.os_autoinst.switch.conf"
     DESTINATION "${CMAKE_INSTALL_FULL_SYSCONFDIR}/dbus-1/system.d"
     COMPONENT "openvswitch"
     EXCLUDE_FROM_ALL
 )
-install(
-    FILES "check_qemu_oom"
-    DESTINATION "${OS_AUTOINST_DATA_DIR}"
-    PERMISSIONS ${EXECUTABLE_PERMISSIONS}
-)
+foreach (EXTRA_SCRIPT check_qemu_oom dewebsockify vnctest)
+    install(
+        FILES "${EXTRA_SCRIPT}"
+        DESTINATION "${OS_AUTOINST_DATA_DIR}"
+        PERMISSIONS ${EXECUTABLE_PERMISSIONS}
+    )
+endforeach ()
 add_custom_target(install-openvswitch
     COMMAND "${CMAKE_COMMAND}" -DCMAKE_INSTALL_COMPONENT=openvswitch -P "${CMAKE_BINARY_DIR}/cmake_install.cmake")
 

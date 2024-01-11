@@ -10,11 +10,14 @@ require IPC::System::Simple;
 use XML::LibXML;
 use File::Temp 'tempfile';
 use File::Basename;
+use File::Which;
+use Mojo::DOM;
+use Mojo::File qw(path);
 use Mojo::JSON qw(decode_json);
 
 use backend::svirt;
 
-has [qw(instance name vmm_family vmm_type)];
+has [qw(instance name vmm_family vmm_type vmm_firmware)];
 
 sub new ($class, $testapi_console = undef, $args = {}) {
     my $self = $class->SUPER::new($testapi_console, $args);
@@ -24,6 +27,7 @@ sub new ($class, $testapi_console = undef, $args = {}) {
     $self->name("openQA-SUT-" . $self->instance);
     $self->vmm_family($bmwqemu::vars{VIRSH_VMM_FAMILY} // 'kvm');
     $self->vmm_type($bmwqemu::vars{VIRSH_VMM_TYPE} // 'hvm');
+    $self->vmm_firmware($bmwqemu::vars{VIRSH_VMM_FIRMWARE} // 'efi');
 
     return $self;
 }
@@ -46,7 +50,7 @@ sub _init_ssh ($self, $args) {
     $self->{ssh_credentials} = {
         default => {
             hostname => $args->{hostname} || die('we need a hostname to ssh to'),
-            username => $args->{username},
+            username => $args->{username} // 'root',
             password => $args->{password},
         }
     };
@@ -62,8 +66,8 @@ sub _init_ssh ($self, $args) {
 
 sub get_ssh_credentials ($self, $domain = undef) {
     $domain //= 'default';
-    die("Unknown ssh credentials domain $domain") unless (exists($self->{ssh_credentials}->{$domain}));
-    return %{$self->{ssh_credentials}->{$domain}};
+    die "Unknown ssh credentials domain $domain" unless my $c = $self->{ssh_credentials}->{$domain};
+    return %$c;
 }
 
 # creates an XML document to configure the libvirt domain
@@ -96,10 +100,12 @@ sub _init_xml ($self, $args = {}) {
     $root->appendChild($elem);
 
     my $os = $doc->createElement('os');
+    $os->setAttribute(firmware => $self->vmm_firmware) if ($bmwqemu::vars{UEFI} and $self->vmm_family eq 'vmware');
     $root->appendChild($os);
 
     $elem = $doc->createElement('type');
     $elem->appendTextNode($self->vmm_type);
+    $elem->setAttribute(arch => $bmwqemu::vars{ARCH}) if ($self->vmm_family eq 'vmware');
     $os->appendChild($elem);
 
     # Following 'features' are required for VM to correctly shutdown
@@ -129,7 +135,7 @@ sub _init_xml ($self, $args = {}) {
         $root->appendChild($elem);
     }
 
-    if ($bmwqemu::vars{UEFI} and $bmwqemu::vars{ARCH} eq 'x86_64' and !$bmwqemu::vars{BIOS} and $bmwqemu::vars{VIRSH_VMM_FAMILY} ne 'hyperv') {
+    if ($bmwqemu::vars{UEFI} and $bmwqemu::vars{ARCH} eq 'x86_64' and !$bmwqemu::vars{BIOS} and $bmwqemu::vars{VIRSH_VMM_FAMILY} ne 'hyperv' and $bmwqemu::vars{VIRSH_VMM_FAMILY} ne 'vmware') {
         foreach my $firmware (@bmwqemu::ovmf_locations) {
             if (!$self->run_cmd("test -e $firmware")) {
                 $bmwqemu::vars{BIOS} = $firmware;
@@ -350,10 +356,21 @@ sub _copy_image_vmware ($self, $name, $backingfile, $file_basename, $vmware_open
     die "Can't create thin VMware image" if $retval;
 }
 
+sub _system (@cmd) { system @cmd }    # uncoverable statement
+
 sub _copy_image_else ($self, $file, $file_basename, $basedir) {
-    $self->run_cmd(sprintf("rsync -av '$file' '$basedir/%s'", $file_basename)) && die 'rsync failed';
+    # utilize asset possibly cached by openQA worker, otherwise sync locally on svirt host (usually relying on NFS mount)
+    if (($bmwqemu::vars{SVIRT_WORKER_CACHE} // 0) && -e $file_basename && defined which 'rsync') {
+        my %c = $self->get_ssh_credentials;
+        my $abs = path($file_basename)->to_abs;    # pass abs path so it can contain a colon
+        bmwqemu::diag "Syncing '$file_basename' directly from worker host to $c{hostname}";
+        _system("sshpass -p '$c{password}' rsync -e 'ssh -o StrictHostKeyChecking=no' -av '$abs' '$c{username}\@$c{hostname}:$basedir/$file_basename'");
+    }
+    else {
+        $self->run_cmd("rsync -av '$file' '$basedir/$file_basename'") && die 'rsync failed';
+    }
     if ($file_basename =~ /(.*)\.xz$/) {
-        $self->run_cmd(sprintf("nice ionice unxz -f -k '$basedir/%s'", $file_basename)) unless -e "$basedir$1";
+        $self->run_cmd("nice ionice unxz -f -k '$basedir/$file_basename'");
         $file_basename = $1;
     }
 }
@@ -388,7 +405,7 @@ sub _copy_image_to_vm_host ($self, $args, $vmware_openqa_datastore, $file, $name
         my (undef, $json) = $self->run_cmd("qemu-img info --output=json $args->{file}", wantarray => 1);
         my $image_vsize = decode_json($json)->{'virtual-size'};
         $size = (($size * 1024 * 1024 * 1024) <= $image_vsize) ? $image_vsize : $size . 'G';
-        $self->run_cmd(sprintf("qemu-img create '${file}' -f qcow2 -b '$basedir/%s' ${size}", $file_basename))
+        $self->run_cmd(sprintf("qemu-img create '${file}' -f qcow2 -F qcow2 -b '$basedir/%s' ${size}", $file_basename))
           && die 'qemu-img create with backing file failed';
     }
     return $file;
@@ -482,7 +499,7 @@ sub get_remote_vmm ($self) { $bmwqemu::vars{VMWARE_REMOTE_VMM} // '' }
 sub define_and_start ($self) {
     my $remote_vmm = "";
     if ($self->vmm_family eq 'vmware') {
-        my ($fh, $libvirtauthfilename) = File::Temp::tempfile(DIR => "/tmp/");
+        my ($fh, $libvirtauthfilename) = File::Temp::tempfile('libvirtauth-XXXX', DIR => "/tmp/");
 
         # The libvirt esx driver supports connection over HTTP(S) only. When
         # asked to authenticate we provide the password via 'authfile'.
@@ -521,13 +538,32 @@ __END"
     # define the new domain
     $self->run_cmd("virsh $remote_vmm define $xmlfilename") && die "virsh define failed";
     if ($self->vmm_family eq 'vmware') {
-        $self->run_cmd('echo bios.bootDelay = \"10000\" >> /vmfs/volumes/datastore1/openQA/' . $self->name . '.vmx', domain => 'sshVMwareServer');
+        my $vmx = sprintf('/vmfs/volumes/%s/openQA/%s.vmx', $bmwqemu::vars{VMWARE_DATASTORE} // 'datastore1', $self->name);
+
+        # set default boot delay
+        $self->run_cmd(qq{echo 'bios.bootDelay = "10000"' >> $vmx}, domain => 'sshVMwareServer');
+
+        # inject cloud init metadata and userdata required for the image if there are any
+        my $ci_meta = $bmwqemu::vars{CLOUD_INIT_META};
+        my $ci_user = $bmwqemu::vars{CLOUD_INIT_USER};
+        my $ci_encoding = $bmwqemu::vars{CLOUD_INIT_ENCODING};
+
+        if ($ci_meta && $ci_user && $ci_encoding) {
+            $self->run_cmd(qq{echo 'guestinfo.metadata = "$ci_meta"' >> $vmx}, domain => 'sshVMwareServer');
+            $self->run_cmd(qq{echo 'guestinfo.metadata.encoding = "$ci_encoding"' >> $vmx}, domain => 'sshVMwareServer');
+            $self->run_cmd(qq{echo 'guestinfo.userdata = "$ci_user"' >> $vmx}, domain => 'sshVMwareServer');
+            $self->run_cmd(qq{echo 'guestinfo.userdata.encoding = "$ci_encoding"' >> $vmx}, domain => 'sshVMwareServer');
+        }
     }
 
     $ret = $self->run_cmd("virsh $remote_vmm start " . $self->name . ' 2> >(tee /tmp/os-autoinst-' . $self->name . '-stderr.log >&2)');
     bmwqemu::diag("Dump actually used libvirt configuration file " . ($ret ? "(broken)" : "(working)"));
-    $self->run_cmd("virsh $remote_vmm dumpxml " . $self->name);
-    die "virsh start failed" if $ret;
+    my $config = $self->get_cmd_output("virsh $remote_vmm dumpxml " . $self->name);
+    die "virsh start failed: $ret\n\nvirsh domain XML:\n$config" if $ret;
+    my $config_domain = Mojo::DOM->new($config)->at('domain');
+    my $vm_id = $config_domain ? $config_domain->attr('id') : '';
+    die "virsh domain XML does not specify VM ID which is required from VNC over WebSockets:\n$config" if !$vm_id && $bmwqemu::vars{VMWARE_VNC_OVER_WS};
+    $bmwqemu::vars{VIRSH_VM_ID} = $vm_id;
 
     $self->backend->start_serial_grab($self->name);
 

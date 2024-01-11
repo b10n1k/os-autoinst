@@ -9,6 +9,7 @@ use File::Basename 'dirname';
 use File::Path 'mkpath';
 use File::Which;
 use Time::HiRes qw(sleep gettimeofday);
+use Time::Seconds;
 use IO::Socket::UNIX 'SOCK_STREAM';
 use IO::Handle;
 use POSIX qw(strftime :sys_wait_h mkfifo);
@@ -19,11 +20,12 @@ use Fcntl;
 use Net::DBus;
 use bmwqemu qw(diag);
 require IPC::System::Simple;
-use osutils qw(find_bin gen_params qv run_diag runcmd);
+use osutils qw(find_bin qv run_diag runcmd);
 use List::Util qw(first max);
 use Data::Dumper;
 use Mojo::IOLoop::ReadWriteProcess::Session 'session';
 use OpenQA::Qemu::Proc;
+use Socket;
 
 # The maximum value of the system's native signed integer. Which will probably
 # be 2^64 - 1.
@@ -42,8 +44,6 @@ sub new ($class) {
 }
 
 # baseclass virt method overwrite
-
-sub raw_alive ($self) { $self->{proc}->_process->is_running }
 
 sub _wrap_hmc ($cmdline) { {
         execute => 'human-monitor-command',
@@ -218,8 +218,8 @@ sub _wait_for_migrate ($self) {
         $rsp = $self->handle_qmp_command({execute => 'query-migrate'}, fatal => 1);
         die 'Migrate to file failed' if $rsp->{return}->{status} eq 'failed';
 
-        diag "Migrating total bytes:     \t" . $rsp->{return}->{ram}->{total};
-        diag "Migrating remaining bytes:   \t" . $rsp->{return}->{ram}->{remaining};
+        log::diag "Migrating total bytes:     \t" . $rsp->{return}->{ram}->{total};
+        log::diag "Migrating remaining bytes:   \t" . $rsp->{return}->{ram}->{remaining};
 
         if ($execution_time > $max_execution_time) {
             # migrate_cancel returns an empty hash, so there is no need to check.
@@ -310,7 +310,7 @@ sub save_memory_dump ($self, $args) {
 
     return undef unless $compress_method;
     if ($compress_method eq 'xz') {
-        if (defined which('xz')) {
+        if (defined File::Which::which('xz')) {
             runcmd('xz', '--no-warn', '-T', $compress_threads, "-v$compress_level", "ulogs/$filename");
         }
         else {
@@ -321,20 +321,6 @@ sub save_memory_dump ($self, $args) {
     if ($compress_method eq 'bzip2') {
         runcmd('bzip2', "-v$compress_level", "ulogs/$filename");
     }
-}
-
-sub save_storage_drives ($self, $args) {
-    diag "Attempting to extract disk #%d.", $args->{disk};
-    $self->do_extract_assets(
-        {
-            hdd_num => $args->{disk},
-            name => sprintf("%s-%d-vm_disk_file.qcow2", $args->{filename}, $args->{disk}),
-            dir => "ulogs",
-            format => "qcow2"
-        });
-
-    diag "Successfully extracted disk #%d", $args->{disk};
-    return;
 }
 
 sub inflate_balloon ($self) {
@@ -359,6 +345,55 @@ sub deflate_balloon ($self) {
     return unless $vars->{QEMU_BALLOON_TARGET};
     my $ram_bytes = $vars->{QEMURAM} * 1048576;
     $self->handle_qmp_command({execute => 'balloon', arguments => {value => $ram_bytes}}, fatal => 1);
+}
+
+sub save_storage ($self, $args) {
+    my $vars = \%bmwqemu::vars;
+    my $bdc = $self->{proc}->blockdev_conf;
+    my $fname = $args->{filename};
+    my $rsp = $self->handle_qmp_command({execute => 'query-status'}, fatal => 1);
+    bmwqemu::diag("Saving storage devices (current VM state is $rsp->{return}->{status})");
+    my $was_running = $rsp->{return}->{status} eq 'running';
+    if ($was_running) {
+        $self->inflate_balloon();
+        $self->freeze_vm();
+    }
+    mkpath("assets_public");
+    $bdc->for_each_drive(sub ($drive) {
+            my $size = $drive->{drive}->{size};
+            my $id = "$drive->{id}-backup-$fname";
+            my $node = $drive->{drive}->{node_name};
+            # no need to save CDs
+            return if ($node =~ qr/cd[0-9]-overlay/);
+            my $my_node = "$node-$fname";
+            my $bck_file = "assets_public/$my_node-$vars->{NAME}.qcow2";
+            # create disk
+            runcmd('qemu-img', 'create', '-f', 'qcow2', "$bck_file", $size);
+            my $req = {execute => 'blockdev-add',
+                arguments => {driver => 'qcow2', 'node-name' => $my_node,
+                    file => {driver => 'file', filename => $bck_file}
+                }};
+            $self->handle_qmp_command($req, fatal => 1);
+            $req = {execute => 'blockdev-backup',
+                arguments => {device => $node, target => $my_node,
+                    sync => 'full', 'job-id' => $id}};
+            $self->handle_qmp_command($req, fatal => 1);
+            my $return;
+            my $timeout = $vars->{SAVE_STORAGE_TIMEOUT} // (ONE_MINUTE * 15);
+            # wait for background job to finish before we continue
+            do {
+                die "Saving volume $node exceeded the timeout" if $timeout == 0;
+                my $query = {execute => 'query-jobs'};
+                $return = $self->handle_qmp_command($query, fatal => 1)->{return};
+                sleep 1;
+                --$timeout;
+            } while (@$return);
+    });
+    bmwqemu::diag("Saving storage complete");
+    if ($was_running) {
+        $self->cont_vm();
+        $self->deflate_balloon();
+    }
 }
 
 sub save_snapshot ($self, $args) {
@@ -471,7 +506,7 @@ sub load_snapshot ($self, $args) {
 sub do_extract_assets ($self, $args) {
     my $name = $args->{name};
     my $img_dir = $args->{dir};
-    my $hdd_num = $args->{hdd_num} - 1;
+    my $hdd_num = ($args->{hdd_num} // 0) - 1;
     my $pattern = $args->{pflash_vars} ? qr/^pflash-vars$/ : qr/^hd$hdd_num$/;
     $self->{proc}->load_state() unless $self->{proc}->has_state();
     mkpath($img_dir);
@@ -487,7 +522,10 @@ sub find_ovmf () { first { -e } @bmwqemu::ovmf_locations }
 
 sub virtio_console_names () {
     return () unless $bmwqemu::vars{VIRTIO_CONSOLE};
-    return map { 'virtio_console' . ($_ || '') } (0 .. ($bmwqemu::vars{VIRTIO_CONSOLE_NUM} // 1));
+    return (
+        'virtio_console', 'virtio_console_user',
+        map { 'virtio_console' . $_ } (1 .. ($bmwqemu::vars{VIRTIO_CONSOLE_NUM} // 1) - 1),
+    );
 }
 
 sub virtio_console_fifo_names () { map { $_ . '.in', $_ . '.out' } virtio_console_names }
@@ -503,9 +541,9 @@ sub delete_virtio_console_fifo () { unlink $_ or bmwqemu::fctwarn("Could not unl
 
 sub qemu_params_ofw ($self) {
     my $vars = \%bmwqemu::vars;
-    $vars->{QEMUVGA} ||= "std";
     $vars->{QEMUMACHINE} //= "usb=off";
-    sp('g', '1024x768');
+    # set the initial resolution on PCC and SPARC
+    sp('g', "$self->{xres}x$self->{yres}");
     # newer qemu needs safe cache capability level quirk settings
     # https://progress.opensuse.org/issues/75259
     my $caps = ',cap-cfpc=broken,cap-sbbc=broken,cap-ibs=broken';
@@ -548,6 +586,40 @@ sub setup_tpm ($self, $arch) {
     }
 }
 
+sub _set_graphics_backend ($self, $is_arm) {
+    my $vars = \%bmwqemu::vars;
+    my $device = "VGA";
+    my $options = "";
+    if ($vars->{QEMU_OVERRIDE_VIDEO_DEVICE_AARCH64}) {
+        bmwqemu::fctwarn("QEMU_OVERRIDE_VIDEO_DEVICE_AARCH64 is deprecated, please set QEMU_VIDEO_DEVICE=VGA instead");
+    }
+    else {
+        # annoying pre-existing special-case default for ARM
+        $device = "virtio-gpu-pci" if ($is_arm);
+    }
+    if ($vars->{QEMU_VIDEO_DEVICE}) {
+        bmwqemu::fctwarn("Both QEMUVGA and QEMU_VIDEO_DEVICE set, ignoring deprecated QEMUVGA!") if $vars->{QEMUVGA};
+        $device = $vars->{QEMU_VIDEO_DEVICE};
+    }
+    elsif ($vars->{QEMUVGA}) {
+        my $vga = $vars->{QEMUVGA};
+        bmwqemu::fctwarn("QEMUVGA is deprecated, please set QEMU_VIDEO_DEVICE");
+        $device = "virtio-vga" if ($vga eq "virtio");
+        $device = "qxl-vga" if ($vga eq "qxl");
+        $device = "cirrus-vga" if ($vga eq "cirrus");
+        $device = "VGA" if ($vga eq "std");
+    }
+    my @edids = ("VGA", "virtio-vga", "virtio-gpu-pci", "bochs-display", "virtio-gpu");
+    if (grep { $device eq $_ } @edids) {
+        # these devices support EDID
+        $options = ",edid=on,xres=$self->{xres},yres=$self->{yres}";
+    }
+    if ($vars->{QEMU_VIDEO_DEVICE_OPTIONS}) {
+        $options .= "," . $vars->{QEMU_VIDEO_DEVICE_OPTIONS};
+    }
+    sp('device', "${device}${options}");
+}
+
 sub start_qemu ($self) {
     my $vars = \%bmwqemu::vars;
 
@@ -556,7 +628,7 @@ sub start_qemu ($self) {
 
     my $qemuimg = find_bin('/usr/bin/', qw(kvm-img qemu-img));
 
-    local *sp = sub { $self->{proc}->static_param(@_); };
+    local *sp = sub (@args) { $self->{proc}->static_param(@args); };
     $vars->{VIRTIO_CONSOLE} = 1 if ($vars->{VIRTIO_CONSOLE} // '') ne 0;
 
     unless ($qemubin) {
@@ -573,7 +645,7 @@ sub start_qemu ($self) {
                     last;
                 }
             }
-            $qemubin = find_bin('/usr/bin/', @execs) unless $qemubin;
+            $qemubin ||= find_bin('/usr/bin/', @execs) // find_bin('/usr/libexec/', @execs);
         }
     }
 
@@ -584,7 +656,7 @@ sub start_qemu ($self) {
     $self->{proc}->qemu_img_bin($qemuimg);
 
     # Get qemu version
-    my $qemu_version = `$qemubin -version`;
+    my $qemu_version = qx{$qemubin -version};
     $qemu_version =~ /([0-9]+([.][0-9]+)+)/;
     $qemu_version = $1;
     $self->{qemu_version} = $qemu_version;
@@ -599,7 +671,7 @@ sub start_qemu ($self) {
     }
     elsif ($vars->{UEFI} && (($vars->{ARCH} // '') eq 'x86_64')) {
         $vars->{UEFI_PFLASH_CODE} //= find_ovmf;
-        $vars->{UEFI_PFLASH_VARS} //= $vars->{UEFI_PFLASH_CODE} =~ s/code/vars/r;
+        $vars->{UEFI_PFLASH_VARS} //= $vars->{UEFI_PFLASH_CODE} =~ s/code/$&=~tr,CcOoDdEe,VvAaRrSs,r/eir;
         die "No UEFI firmware can be found! Please specify UEFI_PFLASH_CODE/UEFI_PFLASH_VARS or BIOS or UEFI_BIOS or install an appropriate package" unless $vars->{UEFI_PFLASH_CODE};
     }
     if ($vars->{UEFI_PFLASH} || $vars->{BIOS}) {
@@ -620,7 +692,7 @@ sub start_qemu ($self) {
         if ($vars->{LAPTOP} =~ /\/|\.\./) {
             die "invalid characters in LAPTOP\n";
         }
-        $vars->{LAPTOP} = 'dell_e6330' if $vars->{LAPTOP} eq '1';
+        $vars->{LAPTOP} = 'hp_elitebook_820g1' if $vars->{LAPTOP} eq '1';
         die "no dmi data for '$vars->{LAPTOP}'\n" unless -d "$bmwqemu::scriptdir/dmidata/$vars->{LAPTOP}";
     }
 
@@ -638,13 +710,14 @@ sub start_qemu ($self) {
             $bootfrom = 'disk';
             $vars->{BOOTFROM} = 'c';
         }
+        elsif ($bootfrom_var eq 'n' || $bootfrom_var eq 'net') {
+            $bootfrom = 'net';
+            $vars->{BOOTFROM} = 'n';
+        }
         else {
             die "unknown/unsupported boot order: $bootfrom_var";
         }
     }
-
-    die 'HDDFORMAT has been removed. If you are using existing images in some other format then qcow2 overlays will be created on top of them'
-      if $vars->{HDDFORMAT};
 
     # disk settings
     if ($vars->{MULTIPATH}) {
@@ -668,22 +741,33 @@ sub start_qemu ($self) {
         $vars->{VDE_PORT} ||= ($vars->{WORKER_ID} // 0) * 2 + 2;
     }
 
+    # arch discovery
+    my $arch = $vars->{ARCH} // '';
+    $arch = 'arm' if ($arch =~ /armv6|armv7/);
+    my $is_arm = $arch eq 'aarch64' || $arch eq 'arm';
+    my $is_ppc = $arch =~ /ppc/;
+    my $is_riscv = $arch eq 'riscv64';
+    my $is_s390x = $arch eq 's390x';
+    my $is_x86 = $arch eq 'i586' || $arch eq 'x86_64';
+
+    $self->_set_graphics_backend($is_arm);
+
     # misc
     my $arch_supports_boot_order = $vars->{UEFI} ? 0 : 1;    # UEFI/OVMF supports ",bootindex=N", but not "-boot order=X"
     my $use_usb_kbd;
-    my $arch = $vars->{ARCH} // '';
-    $arch = 'arm' if ($arch =~ /armv6|armv7/);
+    my $use_virtio_kbd;
 
-    if ($arch eq 'aarch64' || $arch eq 'arm') {
-        my $video_device = ($vars->{QEMU_OVERRIDE_VIDEO_DEVICE_AARCH64}) ? 'VGA' : 'virtio-gpu-pci';
-        sp('device', $video_device);
+    if ($is_arm || $is_riscv) {
         $arch_supports_boot_order = 0;
         $use_usb_kbd = 1;
+    }
+    elsif ($is_s390x) {
+        $arch_supports_boot_order = 0;
+        $use_virtio_kbd = 1;
     }
     elsif ($vars->{OFW}) {
         $use_usb_kbd = $self->qemu_params_ofw;
     }
-    sp('vga', $vars->{QEMUVGA}) if $vars->{QEMUVGA};
 
     my @nicmac;
     my @nicvlan;
@@ -737,9 +821,9 @@ sub start_qemu ($self) {
             my @cmd = ('slirpvde', '--dhcp', '-s', "$vars->{VDE_SOCKETDIR}/vde.ctl", '--port', $port + 1);
             my $child_pid = $self->_child_process(
                 sub {
-                    $SIG{__DIE__} = undef;    # overwrite the default - just exit
-                    exec(@cmd);
-                    die "failed to exec slirpvde";
+                    # overwrite the default die handler to just exit
+                    $SIG{__DIE__} = undef;    # uncoverable statement
+                    exec @cmd or die "failed to exec slirpvde: $!";    # uncoverable statement
                 });
             diag join(' ', @cmd) . " started with pid $child_pid";
 
@@ -770,23 +854,25 @@ sub start_qemu ($self) {
     sp('chardev', 'ringbuf,id=serial0,logfile=serial0,logappend=on');
     sp('serial', 'chardev:serial0');
 
-    if ($self->requires_audiodev) {
-        my $audiodev = $vars->{QEMU_AUDIODEV} // 'intel-hda';
-        my $audiobackend = $vars->{QEMU_AUDIOBACKEND} // 'none';
-        sp('audiodev', $audiobackend . ',id=snd0');
-        if ("$audiodev" eq "intel-hda") {
-            sp('device', $audiodev);
-            $audiodev = "hda-output";
+    if (!$is_s390x) {
+        if ($self->requires_audiodev) {
+            my $audiodev = $vars->{QEMU_AUDIODEV} // 'intel-hda';
+            my $audiobackend = $vars->{QEMU_AUDIOBACKEND} // 'none';
+            sp('audiodev', $audiobackend . ',id=snd0');
+            if ("$audiodev" eq "intel-hda") {
+                sp('device', $audiodev);
+                $audiodev = "hda-output";
+            }
+            sp('device', $audiodev . ',audiodev=snd0');
         }
-        sp('device', $audiodev . ',audiodev=snd0');
-    }
-    else {
-        my $soundhw = $vars->{QEMU_SOUNDHW} // 'hda';
-        sp('soundhw', $soundhw);
+        else {
+            my $soundhw = $vars->{QEMU_SOUNDHW} // 'hda';
+            sp('soundhw', $soundhw);
+        }
     }
     {
-        # Remove floppy drive device on architectures
-        sp('global', 'isa-fdc.fdtypeA=none') unless ($arch eq 'aarch64' || $arch eq 'arm' || $vars->{QEMU_NO_FDC_SET});
+        # Remove floppy drive device on architectures which have it
+        sp('global', 'isa-fdc.fdtypeA=none') if (($is_ppc || $is_x86) && !$vars->{QEMU_NO_FDC_SET});
 
         sp('m', $vars->{QEMURAM}) if $vars->{QEMURAM};
         sp('machine', $vars->{QEMUMACHINE}) if $vars->{QEMUMACHINE};
@@ -814,13 +900,15 @@ sub start_qemu ($self) {
             else {
                 die "unknown NICTYPE $vars->{NICTYPE}\n";
             }
-            sp('device', [qv "$vars->{NICMODEL} netdev=qanet$i mac=$nicmac[$i]"]);
+            my $bootorder = $vars->{PXEBOOT} ? "bootindex=" . ($i + 1) : '';
+            sp('device', [qv "$vars->{NICMODEL} netdev=qanet$i mac=$nicmac[$i] $bootorder"]);
         }
 
         # Keep additional virtio _after_ Ethernet setup to keep virtio-net as eth0
         if ($vars->{QEMU_VIRTIO_RNG} // 1) {
+            my $rngdev = $is_s390x ? 'virtio-rng' : 'virtio-rng-pci';
             sp('object', 'rng-random,filename=/dev/urandom,id=rng0');
-            sp('device', 'virtio-rng-pci,rng=rng0');
+            sp('device', "$rngdev,rng=rng0");
         }
 
         sp('smbios', $vars->{QEMU_SMBIOS}) if $vars->{QEMU_SMBIOS};
@@ -833,8 +921,10 @@ sub start_qemu ($self) {
         }
         if ($vars->{NBF}) {
             die "Need variable WORKER_HOSTNAME\n" unless $vars->{WORKER_HOSTNAME};
-            sp('kernel', '/usr/share/qemu/ipxe.lkrn');
-            sp('append', "dhcp && sanhook iscsi:$vars->{WORKER_HOSTNAME}::3260:1:$vars->{NBF}", no_quotes => 1);
+            sp('kernel', -e '/usr/share/ipxe/ipxe.lkrn' ? '/usr/share/ipxe/ipxe.lkrn' : '/usr/share/qemu/ipxe.lkrn');
+            my $worker_ip = inet_ntoa(inet_aton($vars->{WORKER_HOSTNAME}));
+            die "Unable to determine worker IP from WORKER_HOSTNAME\n" unless $worker_ip;
+            sp('append', "dhcp && sanhook iscsi:${worker_ip}::3260:1:$vars->{NBF}", no_quotes => 1);
         }
 
         $self->setup_tpm($arch);
@@ -844,11 +934,8 @@ sub start_qemu ($self) {
         $vars->{BOOT_MENU} //= 1 if ($vars->{BOOTFROM} && ($arch eq 'aarch64'));
         push @boot_args, ('menu=on,splash-time=' . ($vars->{BOOT_MENU_TIMEOUT} // '5000')) if $vars->{BOOT_MENU};
         if ($arch_supports_boot_order) {
-            if (($vars->{PXEBOOT} // '') eq 'once') {
-                push @boot_args, 'once=n';
-            }
-            elsif ($vars->{PXEBOOT}) {
-                push @boot_args, 'n';
+            if ($vars->{PXEBOOT}) {
+                push @boot_args, ($vars->{PXEBOOT} eq 'once' ? 'once=n' : 'n');
             }
             elsif ($vars->{BOOTFROM}) {
                 push @boot_args, "order=$vars->{BOOTFROM}";
@@ -868,12 +955,20 @@ sub start_qemu ($self) {
         }
 
         unless ($vars->{QEMU_NO_TABLET}) {
-            sp('device', ($vars->{OFW} || $arch eq 'aarch64') ? 'nec-usb-xhci' : 'qemu-xhci');
-            sp('device', 'usb-tablet');
+            sp('device', ($vars->{OFW} || $arch eq 'aarch64') ? 'nec-usb-xhci' : $is_s390x ? 'virtio-tablet' : 'qemu-xhci');
+            sp('device', 'usb-tablet') unless $is_s390x;
         }
 
         sp('device', 'usb-kbd') if $use_usb_kbd;
-        sp('smp', $vars->{QEMUTHREADS} ? [qv "$vars->{QEMUCPUS} threads=$vars->{QEMUTHREADS}"] : $vars->{QEMUCPUS});
+        sp('device', 'virtio-keyboard') if $use_virtio_kbd;
+
+        my $smp_config = [$vars->{QEMUCPUS}];
+        for my $key (qw(QEMUSOCKETS QEMUDIES QEMUCLUSTERS QEMUCORES QEMUTHREADS)) {
+            my $qkey = lc($key =~ s/^QEMU//r);
+            push @$smp_config, "$qkey=$vars->{$key}" if exists $vars->{$key};
+        }
+        sp('smp', $smp_config);
+
         if ($vars->{QEMU_NUMA}) {
             for my $i (0 .. ($vars->{QEMUCPUS} - 1)) {
                 my $m = int($vars->{QEMURAM} / $vars->{QEMUCPUS});
@@ -881,7 +976,7 @@ sub start_qemu ($self) {
                 # allocated
                 $m += $vars->{QEMURAM} % $vars->{QEMUCPUS} if $i == 0;
                 sp('object', "memory-backend-ram,size=${m}m,id=m$i");
-                sp('numa', [qv "node nodeid=$i,memdev=m$i"]);
+                sp('numa', [qv "node nodeid=$i,memdev=m$i,cpus=$i"]);
             }
         }
 
@@ -890,7 +985,9 @@ sub start_qemu ($self) {
 
         if ($vars->{VNC}) {
             my $vncport = $vars->{VNC} !~ /:/ ? ":$vars->{VNC}" : $vars->{VNC};
-            sp('vnc', [qv "$vncport share=force-shared"]);
+            my $extravars = $vars->{VNC_EXTRA_VARS};
+            $extravars = defined $extravars ? " $extravars" : '';
+            sp('vnc', [qv "$vncport share=force-shared$extravars"]);
             sp('k', $vars->{VNCKB}) if $vars->{VNCKB};
         }
 

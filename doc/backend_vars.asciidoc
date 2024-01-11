@@ -9,6 +9,7 @@ Variable;Values allowed;Default value;Explanation
 CASEDIR;string;;Absolute or relative path to the test distribution. Specifying the variable is mandatory. Can also be a Git repository URL of a test distribution to checkout with an optional refspec or Git commit hash into the current directory. It tries to follow the definition of https://docs.npmjs.com/cli/v7/configuring-npm/package-json#git-urls-as-dependencies (e.g. `https://github.com/os-autoinst/os-autoinst-distri-opensuse.git#feature/test` or `git@github.com:os-autoinst/os-autoinst-distri-opensuse.git`). Note that cloning via SSH is only possible if Git is configured accordingly on the host where isotovideo is executed. Can be combined with `TEST_GIT_REFSPEC` and `NEEDLES_GIT_REFSPEC`. Relative paths are considered relative to the working directory of `isotovideo`.
 PRODUCTDIR;string;;Absolute or relative path to the optional "product directory" which includes the test schedule entry point `main.pm` as well as a `needles` subdirectory with the needles to load. Defaults to `CASEDIR`. Relative paths are considered relative to `CASEDIR`.
 NEEDLES_DIR;string;;Absolute or relative path to the needles subdirectory. Defaults to `needles` within `PRODUCTDIR`. Can also be a Git repository URL, comparable to `CASEDIR`. Relative paths are considered relative to the working directory of `isotovideo`.
+WHEELS_DIR;string;;Absolute or relative path to the directory wheels are stored in if `CASEDIR` contains a `wheels.yaml`. Defaults to the working directory of `isotovideo`. Relative paths are considered relative to the working directory of `isotovideo`.
 INCLUDE_MODULES;string;;comma separated names or fullnames of test modules to be included while excluding all that do not match, e.g. "boot,mod1"
 EXCLUDE_MODULES;string;;comma separated names or fullnames of test modules to exclude. Can be combined with INCLUDE_MODULES and has precedence, e.g. to additionally exclude modules based on an include-list
 SCHEDULE;string;;comma or space separated list of relative paths to test modules within CASEDIR to be scheduled instead of evaluating a schedule from the test distributions main.pm file, e.g. "boot,console/mod1". Test modules can be specified without the implicit file extension '.pm'.
@@ -16,7 +17,7 @@ _EXIT_AFTER_SCHEDULE;boolean;0;Exit test execution immediately after evaluation 
 _SKIP_POST_FAIL_HOOKS;boolean;0;Skip the execution of post_fail_hook methods if set. This can be useful to save test execution time during test development when the post_fail_hook is not expected to provide any value as most likely the test developer already knows what needs to be done as a next step on a test fail.
 TEST_GIT_REFSPEC;string;;git refspec to checkout within `CASEDIR` when `CASEDIR` is a git working copy. By default, does not change the content of `CASEDIR`. Overrides the optional git refspec in `CASEDIR`. Can be used to explicitly select a git commit within an existing git working copy and also to skip unnecessary git network transfers when `CASEDIR` is already providing the right git working copy.
 NEEDLES_GIT_REFSPEC;string;;git refspec to checkout within `NEEDLES_DIR`. See `TEST_GIT_REFSPEC` for details.
-EXTERNAL_VIDEO_ENCODER_CMD;string;;Specifies the command line for invoking a custom video encoder. It is supposed to accept a sequence of PPM images via stdin. The placeholder `%OUTPUT_FILE_NAME%` is replaced with the output file path. The output file path is appended if the placeholder is missing. Example: `ffmpeg -hide_banner -nostats -r 24 -f image2pipe -vcodec ppm -i - -pix_fmt yuv420p -c:v libvpx-vp9 -crf 35 -b:v 1500k -cpu-used 0`
+EXTERNAL_VIDEO_ENCODER_CMD;string;;Specifies the command line for invoking a custom video encoder. It is supposed to accept a sequence of PPM images via stdin. The placeholder `%OUTPUT_FILE_NAME%` is replaced with the output file path. The output file path is appended if the placeholder is missing. Examples: `ffmpeg -y -hide_banner -nostats -r 24 -f image2pipe -vcodec ppm -i - -pix_fmt yuv420p -c:v libvpx-vp9 -crf 35 -b:v 1500k -cpu-used 1`, `podman run --rm --workdir /pool -i -v .:/pool ghcr.io/tamara-schmitz/ffmpeg-docker-container-free -y -hide_banner -nostats -r 24 -f image2pipe -vcodec ppm -i - -pix_fmt yuv420p -c:v libsvtav1 -preset 10 -crf 35`
 EXTERNAL_VIDEO_ENCODER_OUTPUT_FILE_EXTENSION;string;webm;The extension of the output file when `EXTERNAL_VIDEO_ENCODER_CMD` is used.
 EXTERNAL_VIDEO_ENCODER_ADDITIONALLY;boolean;0;Whether `EXTERNAL_VIDEO_ENCODER_CMD` should only be invoked additionally to the built-in Theora encoder. This means two videos will be created and uploaded which can be useful for comparison. (Configuring an external video encoder disables the built-in one by default.)
 NOVIDEO;boolean;0;Whether the creation of the video should be disabled and also any `EXTERNAL_VIDEO_ENCODER_` variables be ignored.
@@ -33,9 +34,10 @@ VNC_CONNECT_TIMEOUT_REMOTE;integer;60;Timeout for remote VNC connections in seco
 _CHKSEL_RATE_WAIT_TIME;integer;30;The amount of time isotovideo is going to wait for the VNC console to become responsive
 _CHKSEL_RATE_HITS;integer;15000;The amount of times, the select should return the same fileno during the _CHKSEL_RATE_WAIT_TIME seconds, to consider the VNC console unresponsive
 TIMEOUT_SCALE;integer;1;This scale parameter can be used based on performance of workers to prevent false positive timeouts based on differing worker performance.
-PAUSE_AT;string;;Test module (name or fullname) to pause test execution at. To be used together with the openQA developer mode to continue test execution. Be aware that the openQA web UI will only reflect this within the developer mode after confirming to control the test.
+PAUSE_AT;string;;Test module (name or fullname) to pause test execution at. To be used together with the openQA developer mode which also allows to continue test execution again. Note that this does not start a developer mode session. So you still need to confirm taking control over the test to access the developer mode controls.
 PAUSE_ON_SCREEN_MISMATCH;boolean;0;Pause test execution on the next screen mismatch. Same notes as for `PAUSE_AT` apply.
 PAUSE_ON_NEXT_COMMAND;boolean;0;Pause test execution on the next test API command. Same notes as for `PAUSE_AT` apply.
+PAUSE_ON_FAILURE;boolean;0;Pause test execution on a test failure (instead of invoking the post-fail hook and terminating). Same notes as for `PAUSE_AT` apply.
 _QUIET_SCRIPT_CALLS;boolean;0;Add quiet flag to all the calls to script_run, script_output and validate_script_output. It will omit all the squares "wait_serial expected" on the Details view of the test case. This option might be useful for serial terminal tests.
 _WAIT_STILL_SCREEN_ON_HERE_DOC_INPUT;float;0;If this value is greater then 0, it is used by `wait_still_screen` before starting to write the script into the here document used in `testapi::script_output()` function (see: poo#60566). By default this depends on the backend.
 AUTOINST_URL_HOSTNAME;string;;hostname or IP address of host running the autoinst webserver endpoint, defaults to the local IP address within the qemu network for the qemu backend or the `WORKER_HOSTNAME` otherwise.
@@ -43,6 +45,11 @@ UPLOAD_METER;boolean;0;Display curl progress meter in `upload_logs()` and `uploa
 UPLOAD_MAX_MESSAGE_SIZE_GB;integer;0;Specifies the max. upload size in GiB for the test API functions `upload_logs()` and `upload_assets()` and the underlying command server API. Zero denotes infinity.
 UPLOAD_INACTIVITY_TIMEOUT;integer;300;Specifies the inactivity timeout in seconds for the test API functions `upload_logs()` and `upload_assets()` and underlying the command server API.
 NO_DEPRECATE_BACKEND_$backend;boolean;0;Only warn about deprecated backends instead of aborting
+XRES;integer;1024;Resolution of display on x axis. Sets the resolution of the video encoder, and in qemu, the initial console resolution when OFW is set (Power and SPARC), and the EDID resolution for devices that support EDID
+YRES;integer;768;Resolution of display on y axis. Sets the resolution of the video encoder, and in qemu, the initial console resolution when OFW is set (Power and SPARC), and the EDID resolution for devices that support EDID
+VIDEO_ENCODER_BLOCKING_PIPE;boolean;0;Whether the pipe for writing data to the video encoder should be blocking or not. Making it blocking might allow following the live view in realtime despite large screenshot file sizes but it is not a well tested configuration
+DEFAULT_CLICK_SLEEP;float;0.15;Default single click time in seconds
+DEFAULT_DCLICK_SLEEP;float;0.10;Default double/triple click time in seconds (both press time and interval between clicks)
 
 |====================
 
@@ -100,10 +107,9 @@ BIOS;;;Set the filename for the BIOS
 BOOT_HDD_IMAGE;boolean;;enables boot from HDD_1 (BOOTFROM has higher priority)
 BOOT_MENU;boolean;undef;enables boot menu for selection of boot device
 BOOT_MENU_TIMEOUT;integer;5000;boot menu timeout in ms. Needs BOOT_MENU
-BOOTFROM;chars;undef;Influences order of boot devices. See qemu -boot option
+BOOTFROM;chars;undef;Influences order of boot devices. Multi boot order is not supported. This variable can be overriden by `PXEBOOT`. See qemu -boot option and PXEBOOT variable.
 CDMODEL;see qemu -device ?;undef;Storage device for virtualized CD
 DELAYED_START;boolean;;delay vm cpu start until resume_vm() is called
-HDDFORMAT;;;HDD format
 HDDMODEL;see qemu -device ?;virtio-blk;Storage device for virtualized HDD.
 HDDMODEL_$_;see qemu -device ?;virtio-blk;Storage device for virtualized HDD. Overrides global HDDMODEL for HDD_$i
 HDDSIZEGB;integer;10;Creates HDD with specified size in GiB
@@ -112,7 +118,7 @@ HDDNUMQUEUES_$i;integer;-1;see qemu-system-x86_64 -device nvme,help - set the nu
 ISO;filename;;Filename of ISO file to be attached to VM
 ISO_$i;filename;;Additional ISO to be attached to VM. Up to 9
 KEEPHDDS;boolean;;Leave created HDD after test finishes. Useful for debugging tests
-LAPTOP;boolean or filename;0;If 1, loads Dell E6330 DMI. If filename, loads specified DMI
+LAPTOP;boolean or filename;0;If 1, loads HP EliteBook 820 G1 DMI. If filename, loads specified DMI
 MAKETESTSNAPSHOTS;boolean;0;Save snapshot for each test module in qcow image
 MULTIPATH;boolean;0;Add HDD drives as multipath devices. Override HDDMODEL to virtio-scsi-pci
 NBF;boolean;0;open source network boot firmware e.g. to attach iscsi target on boot http://ipxe.org/
@@ -121,28 +127,32 @@ NICMODEL;see qemu -device ?;virtio-net;Network device virtual NIC.
 NICTYPE;user|tap|vde;user;Instruct QEMU to either use user networking or to connect virtual NIC to existin system TAP device
 NICTYPE_USER_OPTIONS;string;undef;Arbitrary options for NICTYPE
 NICVLAN;integer;undef;Comma-separated list of network (vlan) numbers to which the NIC should be connected, assigned by scheduler to jobs with NICTYPE != user
-NUMDISKS;integer;1;Number of disks to be created and attached to VM, can be 0 to disable disks
+NUMDISKS;integer;1;Number of disks to be created and attached to VM, can be 0 to disable disks, if using RAIDLEVEL, will be set to 4
 OFFLINE_SUT;boolean;0;Disable network for a VM
 OFW;boolean;0;QEMU Open Firmware is in use
 OVS_DEBUG;integer;undef;Set debug mode if value is 1
 QEMU_ONLY_EXEC;boolean;undef;If set, only execute the qemu process but return early before connecting to the process. This can be helpful for cutting testing time or to connect to the qemu process manually.
 QEMU_WAIT_FINISH;boolean;undef;Only used for internal testing, see comment in t/18-qemu-options.t for details.
-QEMU_OVERRIDE_VIDEO_DEVICE_AARCH64;boolean;undef;If set, for aarch64 systems use VGA as video adapter
+QEMU_OVERRIDE_VIDEO_DEVICE_AARCH64;boolean;undef;(Deprecated, set QEMU_VIDEO_DEVICE=VGA) If set, and QEMU_VIDEO_DEVICE is not set, for arm systems use VGA as video adapter instead of virtio-gpu-pci
 QEMU_DISABLE_SNAPSHOTS;boolean;undef;If set, disable snapshots in QEMU. This needs to be set when using vmdk disk images or in case the worker has slow disks to avoid save_vm calls failing due to timeouts (See https://bugzilla.suse.com/show_bug.cgi?id=1035453[bsc#1035453])
 QEMU_QMP_CONNECT_ATTEMPTS;integer;20;The number of attempts to connect to qemu qmp. Usually used for internal testing
 PATHCNT;integer;2;Number of paths in MULTIPATH scenario
-PXEBOOT;boolean or 'once';0;Boot VM from network, on every boot or only once if set to 'once'
+PXEBOOT;boolean or 'once';0;Boot VM from network, on every boot or only once if set to 'once'. If value is 1 or 'once' it sets `bootindex=N` for each network device.
 QEMU;QEMU binary filename;undef;Filename of QEMU binary to use
+QEMUCLUSTERS;integer;undef;Number of CPU clusters used by VM
+QEMUCORES;integer;undef;Number of CPU cores used by VM
 QEMUCPU;see qemu -cpu ?;undef;CPU to emulate
 QEMUCPUS;integer;1;Number of CPUs to assign to VM
+QEMUDIES;integer;undef;Number of CPU dies used by VM
 QEMUMACHINE;see qemu -machine ?;undef;Machine and chipset to emulate
 QEMUPORT;integer;20002 + worker instance * 10;Port on which QEMU monitor should listen
 QEMURAM;integer;1024;Size of RAM of VM in MiB
-QEMUTHREADS;integer;0;Number of cpu threads used by VM
+QEMUSOCKETS;integer;undef;Number of CPU sockets used by VM
+QEMUTHREADS;integer;undef;Number of CPU threads used by VM
 QEMUTPM;'instance' or appropriate value for local swtpm config;undef;Configure VM to use a TPM emulator device, with appropriate args for the arch. If a TPM device is available at QEMUTPM_PATH_PREFIX + X, where X is the value of QEMUTPM or the worker instance number if QEMUTPM is set to 'instance', it will be used. Otherwise it will be created at test startup. See QEMUTPM_VER in the latter case.
 QEMUTPM_VER;'1.2' or '2.0' depending on which TPM chip should be emulated;'2.0';If no TPM device has been setup otherwise, swtpm will be used internally to create one with a socket at /tmp/mytpmX
 QEMUTPM_PATH_PREFIX;string;'/tmp/mytpm';Path prefix to use or create TPM emulator device in
-QEMUVGA;see qemu -device ?;cirrus;VGA device to use with VM
+QEMUVGA;virtio,qxl,cirrus,std;See QEMU_VIDEO_DEVICE;(Deprecated, use QEMU_VIDEO_DEVICE instead) VGA device to use with VM (will be converted to a matching -device parameter)
 QEMU_COMPRESS_QCOW2;boolean;1;compress qcow2 images intended for upload
 QEMU_IMG_CREATE_TRIES;integer;3;Define number of tries for qemu-img commands
 QEMU_HUGE_PAGES_PATH;string;undef;Define a path to use huge pages (e.g. /dev/hugepages/)
@@ -163,12 +173,12 @@ QEMU_NON_FATAL_DBUS_CALL;boolean;0;Ignore failed dbus calls and ignore instead o
 QEMU_MAX_BANDWIDTH;integer;INT_MAX;Limits the transfer rate during a snapshot.
 QEMU_DUMP_COMPRESS_METHOD;string;xz;The compression to use during a memory dump. Can be set to xz, bzip2 or internal (QEMU's internal compression, not compatible with crash or gdb). If xz is set, but not available, it will fallback to bzip2. Also see QEMU_COMPRESSION_LEVEL.
 QEMU_APPEND;string;;Append parameters on qemu command line. The first item will have '-' prepended to it.
-QEMU_ENABLE_SMBD;boolean;0;Enable QEMU's built-in samba service for user network. Exported worker's pool will be accessible on `\\10.0.2.4\qemu` share.
+QEMU_ENABLE_SMBD;boolean;0;Enable QEMU's built-in samba service for user network. Exported worker's pool will be accessible on `\\10.0.2.4\qemu` share. Requires `smbd` to be installed (usually part of the `samba` package).
 VIRTIO_CONSOLE;boolean;1;Enable/disable virtio console. (@see `-device virtconsole` qemu option)
 VIRTIO_CONSOLE_NUM;integer;1;Number of virtio consoles.
 QEMU_BALLOON_TARGET;integer;undef;The target guest RAM usage before a snapshot is taken. It is intended to speed up snapshots by forcing the guest to drop various caches. Setting this enables the virtio-balloon device which requires a kernel with a virtio-balloon driver. Setting this far below the RAM required by the guest will probably cause the guest to panic or deadlock. However it should be able to cope with it being set slightly below what is needed.
 QEMU_BALLOON_TIMEOUT;integer;5;Timeout for qemu balloon operations
-RAIDLEVEL;;;Set the raid level
+RAIDLEVEL;;;Set the raid level, affects NUMDISKS.
 SKIPTO;full name of test module;;Restore VM from snapshot and continue by running specified test module. Needs HDD image with snapshots present
 TAPDEV;device name;undef;TAP device name to which virtual NIC should be connected. Usually undef so automatic matching is used
 TAPDOWNSCRIPT;string;undef;Script used during the backend network shutdown
@@ -186,9 +196,13 @@ VDE_PORT;integer;worker instance + 10;number of vde switch port to connect
 VDE_SOCKETDIR;string;.;directory where vde_switch control socket is to be found
 VDE_USE_SLIRP;integer;1;whether to start slirpvde
 VNC;integer;worker instance + 90;Display on which VNC server is running. Actual port is 5900 + VNC
+VNC_EXTRA_VARS;string;;Additional variables passed to the qemu VNC parameter (`-vnc`)
 VNCKB;;;Set the keyboard layout if you are not using en-us
 WORKER_CLASS;string;undef;qemu system types
 WORKER_HOSTNAME;string;undef;Worker hostname
+QEMU_VIDEO_DEVICE;string;virtio-gpu-pci on ARM, VGA otherwise;Video device to use with VM (using -device, not -vga). Can have options appended e.g. "virtio-gpu-gl,edid=on", but it is better to set QEMU_VIDEO_DEVICE_OPTIONS. See qemu docs and https://www.kraxel.org/blog/2019/09/display-devices-in-qemu/ for valid choices
+QEMU_VIDEO_DEVICE_OPTIONS;string;none;Additional options for QEMU_VIDEO_DEVICE (comma-separated). Will be appended after automatically-generated resolution setting options on devices that support EDID
+SAVE_STORAGE_TIMEOUT;integer;900;Timeout for saving one storage volume in `save_storage` test API function.
 |====================
 
 .SVIRT backend
@@ -210,20 +224,22 @@ VIRSH_INSTANCE;integer;;VM's instance number on VIRSH_HOSTNAME
 VMWARE_USERNAME;string;;Administrator's username ('@' is '%40')
 VMWARE_PASSWORD;string;;Administrator's password
 VMWARE_HOST;string;;VCS server for authentication
-VMWARE_DATASTORE;string;;VMware datastore
+VMWARE_DATASTORE;string;datastore1;VMware datastore
 VMWARE_NFS_DATASTORE;string;;VMware datastore with openQA NFS directories
 VMWARE_SERIAL_PORT;string;;TCP port where is VM's serial port stream to be expected on the ESX server
 VMWARE_BRIDGE;string;;VMware's bridge name (usual default is 'VM Network')
 VMWARE_REMOTE_VMM;string;;Set the vmware Virtual Machine Manager
+VMWARE_VNC_OVER_WS;boolean;0;Whether to use VNC over WebSockets (instead of raw VNC connection)
+VMWARE_VNC_OVER_WS_INSECURE;boolean;0;Do not require a valid TLS certificate for VNC over WebSockets
 HYPERV_USERNAME;string;;Administrator account name
 HYPERV_PASSWORD;string;;Password for above account
 HYPERV_SERVER;string;;Windows Server (2008 R2, 2012 R2, or 2016) instance IP address
 HYPERV_SERIAL_PORT;integer;;TCP port where is VM's serial port stream to be expected on the Hyper-V server
-HYPERV_VIRTUAL_SWITCH;string;;ExternalVirtualSwitch;Name of Hyper-V's External Virtual Switch
-NUMDISKS;integer;1;Number of disks
-RAIDLEVEL;integer;undef;Sets the raid level
-HDDFORMAT;;;HDD format
+HYPERV_VIRTUAL_SWITCH;string;;Name of Hyper-V's External Virtual Switch
+NUMDISKS;integer;1;Number of disks to be created and attached to VM, can be 0 to disable disks, if using RAIDLEVEL, will be set to 4
+RAIDLEVEL;integer;undef;Sets the raid level, affects NUMDISKS.
 SVIRT_KEEP_VM_RUNNING;boolean;undef;Keep VM running after execution, disabled by default
+SVIRT_WORKER_CACHE;boolean;0;Use the openQA worker cache if possible to copy images to the svirt host - this means the path specified when invoking `add_disk` is **not** fully regarded, e.g. if the specified path points into the `fixed`-subdirectory but the openQA worker cached the same asset under the regular directory (which it prefers over the `fixed`-subdirectory) then the asset from the regular directory will be used
 WORKER_HOSTNAME;string;undef;Worker hostname
 |====================
 
@@ -292,8 +308,11 @@ Variable;Values allowed;Default value;Explanation
 GENERAL_HW_VNC_IP;string;;Hostname of the gadget's network. If not set, SSH consoles will be used
 GENERAL_HW_VNC_PASSWORD;string;;Password for VNC server
 GENERAL_HW_VNC_PORT;integer;5900;VNC Port number
+GENERAL_HW_VNC_DEPTH;integer;16;Color depth for VNC server
 GENERAL_HW_NO_SERIAL;boolean;;Don't use serial
 GENERAL_HW_VIDEO_STREAM_URL;string;;Video stream URL (in ffmpeg's syntax) to receive, for example 'udp://@:5004' or '/dev/video0'.
+VIDEO_STREAM_PIPE_BUFFER_SIZE;integer;1680*1050*3+20;Buffer containing at least a single PPM frame for video capturing
+GENERAL_HW_KEYBOARD_URL;string;;URL to keyboard emulation device. eg. 'http://1.2.3.4/cmd' - see https://github.com/os-autoinst/os-autoinst-distri-opensuse/tree/master/data/generalhw_scripts/rpi_pico_w_keyboard[rpi_pico_w_keyboard]
 GENERAL_HW_CMD_DIR;string;;Directory with allowed CMD scripts. Note: This variable should be set in the workers.ini file, otherwise it will be ignored by openQA.
 GENERAL_HW_SOL_CMD;string;;Shell Script to output serial output (in CMD_DIR)
 GENERAL_HW_SOL_ARGS;string;;Arguments to pass GENERAL_HW_SOL_CMD Shell script

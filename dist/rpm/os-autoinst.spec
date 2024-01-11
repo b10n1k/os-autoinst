@@ -25,8 +25,8 @@ Group:          Development/Tools/Other
 Url:            https://github.com/os-autoinst/os-autoinst
 Source0:        %{name}-%{version}.tar.xz
 %{perl_requires}
-%if 0%{?suse_version} > 1500
-# openSUSE Tumbleweed
+%if 0%{?suse_version} > 1500 || 0%{?sle_version} >= 150400
+# openSUSE Tumbleweed and Leap 15.4
 %define opencv_require pkgconfig(opencv4)
 %else
 %define opencv_require pkgconfig(opencv)
@@ -36,7 +36,7 @@ Source0:        %{name}-%{version}.tar.xz
 # The following line is generated from dependencies.yaml
 %define build_requires %build_base_requires cmake ninja
 # The following line is generated from dependencies.yaml
-%define main_requires git-core perl(B::Deparse) perl(Carp) perl(Carp::Always) perl(Config) perl(Cpanel::JSON::XS) perl(Crypt::DES) perl(Cwd) perl(Data::Dumper) perl(Digest::MD5) perl(DynaLoader) perl(English) perl(Errno) perl(Exception::Class) perl(Exporter) perl(ExtUtils::testlib) perl(Fcntl) perl(File::Basename) perl(File::Find) perl(File::Path) perl(File::Temp) perl(File::Touch) perl(File::Which) perl(File::chdir) perl(IO::Handle) perl(IO::Scalar) perl(IO::Select) perl(IO::Socket) perl(IO::Socket::INET) perl(IO::Socket::UNIX) perl(IPC::Open3) perl(IPC::Run::Debug) perl(IPC::System::Simple) perl(List::MoreUtils) perl(List::Util) perl(Mojo::IOLoop::ReadWriteProcess) >= 0.26 perl(Mojo::JSON) perl(Mojo::Log) perl(Mojo::URL) perl(Mojo::UserAgent) perl(Mojolicious) >= 8.42 perl(Mojolicious::Lite) perl(Net::DBus) perl(Net::IP) perl(Net::SNMP) perl(Net::SSH2) perl(POSIX) perl(Scalar::Util) perl(Socket) perl(Socket::MsgHdr) perl(Term::ANSIColor) perl(Thread::Queue) perl(Time::HiRes) perl(Time::Moment) perl(Time::Seconds) perl(Try::Tiny) perl(XML::LibXML) perl(XML::SemanticDiff) perl(autodie) perl(base) perl(constant) perl(integer) perl(strict) perl(version) perl(warnings) perl-base
+%define main_requires git-core perl(B::Deparse) perl(Carp) perl(Carp::Always) perl(Config) perl(Cpanel::JSON::XS) perl(Crypt::DES) perl(Cwd) perl(Data::Dumper) perl(Digest::MD5) perl(DynaLoader) perl(English) perl(Errno) perl(Exception::Class) perl(Exporter) perl(ExtUtils::testlib) perl(Fcntl) perl(File::Basename) perl(File::Find) perl(File::Path) perl(File::Temp) perl(File::Touch) perl(File::Which) perl(File::chdir) perl(IO::Handle) perl(IO::Scalar) perl(IO::Select) perl(IO::Socket) perl(IO::Socket::INET) perl(IO::Socket::UNIX) perl(IPC::Open3) perl(IPC::Run::Debug) perl(IPC::System::Simple) perl(JSON::Validator) perl(List::MoreUtils) perl(List::Util) perl(Mojo::IOLoop::ReadWriteProcess) >= 0.26 perl(Mojo::JSON) perl(Mojo::Log) perl(Mojo::URL) perl(Mojo::UserAgent) perl(Mojolicious) >= 9.340.0 perl(Mojolicious::Lite) perl(Net::DBus) perl(Net::Domain) perl(Net::IP) perl(Net::SNMP) perl(Net::SSH2) perl(POSIX) perl(Scalar::Util) perl(Socket) perl(Socket::MsgHdr) perl(Term::ANSIColor) perl(Thread::Queue) perl(Time::HiRes) perl(Time::Moment) perl(Time::Seconds) perl(Try::Tiny) perl(XML::LibXML) perl(XML::SemanticDiff) perl(YAML::PP) perl(YAML::XS) perl(autodie) perl(base) perl(constant) perl(integer) perl(strict) perl(version) perl(warnings) perl-base rsync sshpass
 # all requirements needed by the tests, do not require on this in the package
 # itself or any sub-packages
 # SLE is missing spell check requirements
@@ -73,25 +73,45 @@ Source0:        %{name}-%{version}.tar.xz
 %else
 %define python_style_requires %{nil}
 %endif
+%ifnarch ppc ppc64 ppc64le s390x
+%bcond_without ocr
+%else
+%bcond_with ocr
+%endif
+%if %{with ocr}
 # The following line is generated from dependencies.yaml
-%define test_base_requires %main_requires cpio icewm perl(Benchmark) perl(Devel::Cover) perl(FindBin) perl(Pod::Coverage) perl(Test::Fatal) perl(Test::Mock::Time) perl(Test::MockModule) perl(Test::MockObject) perl(Test::MockRandom) perl(Test::Mojo) perl(Test::Most) perl(Test::Output) perl(Test::Pod) perl(Test::Strict) perl(Test::Warnings) >= 0.029 procps python3-setuptools qemu >= 4.0 qemu-tools qemu-x86 xorg-x11-Xvnc xterm xterm-console
+%define ocr_requires tesseract-ocr tesseract-ocr-traineddata-english
+%else
+%define ocr_requires %{nil}
+%endif
+# The following line is generated from dependencies.yaml
+%define test_base_requires %main_requires cpio icewm ipxe-bootimgs perl(Benchmark) perl(Devel::Cover) perl(FindBin) perl(Pod::Coverage) perl(Test::Fatal) perl(Test::Mock::Time) perl(Test::MockModule) perl(Test::MockObject) perl(Test::MockRandom) perl(Test::Mojo) perl(Test::Most) perl(Test::Output) perl(Test::Pod) perl(Test::Strict) perl(Test::Warnings) >= 0.029 procps python3-setuptools qemu >= 4.0 qemu-tools qemu-x86 xorg-x11-Xvnc xterm xterm-console
 # The following line is generated from dependencies.yaml
 %define test_version_only_requires perl(Mojo::IOLoop::ReadWriteProcess) >= 0.28
 # The following line is generated from dependencies.yaml
-%define test_requires %build_requires %spellcheck_requires %test_base_requires %yamllint_requires perl(Inline::Python) perl(YAML::PP) python3-Pillow-tk
+%define test_requires %build_requires %ocr_requires %spellcheck_requires %test_base_requires %yamllint_requires perl(Inline::Python) python3-Pillow-tk
 # The following line is generated from dependencies.yaml
-%define devel_requires %python_style_requires %test_requires ShellCheck perl(Code::TidyAll) perl(Devel::Cover) perl(Devel::Cover::Report::Codecov) perl(Perl::Tidy)
-%define s390_zvm_requires /usr/bin/xkbcomp /usr/bin/Xvnc x3270 icewm xterm xterm-console xdotool fonts-config mkfontdir mkfontscale
+%define devel_requires %python_style_requires %test_requires ShellCheck perl(Code::TidyAll) perl(Devel::Cover) perl(Devel::Cover::Report::Codecov) perl(Perl::Tidy) perl(Template::Toolkit)
+%define s390_zvm_requires /usr/bin/xkbcomp /usr/bin/Xvnc x3270 icewm xterm xterm-console xdotool fonts-config mkfontdir mkfontscale openssh-clients
+%define qemu_requires qemu-tools e2fsprogs
 BuildRequires:  %test_requires %test_version_only_requires
+# For unbuffered output of Perl testsuite, especially when running it on OBS so timestamps in the log are actually useful
+BuildRequires:  expect
 Requires:       %main_requires
+%if %{with ocr}
 Recommends:     tesseract-ocr
+%endif
 Recommends:     dumponlyconsole %s390_zvm_requires
 Recommends:     qemu >= 4.0.0
-Recommends:     qemu-tools
+Recommends:     %qemu_requires
 # Optional dependency for Python test API support
 Recommends:     perl(Inline::Python)
 # Optional dependency for crop.py
 Recommends:     python3-Pillow-tk
+# Optional dependency for QEMU's built-in samba service (enabled via QEMU_ENABLE_SMBD=1)
+Recommends:     samba
+# More efficient video encoding is done automatically if ffmpeg is present
+Recommends:     ffmpeg >= 4
 Requires(pre):  %{_bindir}/getent
 Requires(pre):  %{_sbindir}/useradd
 BuildRoot:      %{_tmppath}/%{name}-%{version}-build
@@ -120,6 +140,7 @@ Group:          Development/Tools/Other
 Requires:       openvswitch
 Requires:       openvswitch-switch
 Requires:       os-autoinst
+Requires(post): dbus-1
 
 %description openvswitch
 This package contains openvswitch support for os-autoinst.
@@ -130,7 +151,7 @@ Summary:        Convenience package providing os-autoinst+qemu-kvm
 Group:          Development/Tools/Other
 Requires:       os-autoinst
 Requires:       qemu-kvm >= 4.0.0
-Requires:       qemu-tools
+Requires:       %qemu_requires
 
 %description qemu-kvm
 
@@ -139,7 +160,7 @@ Summary:        Convenience package providing os-autoinst+qemu-x86
 Group:          Development/Tools/Other
 Requires:       os-autoinst
 Requires:       qemu-x86 >= 4.0.0
-Requires:       qemu-tools
+Requires:       %qemu_requires
 
 %description qemu-x86
 Convenience package providing os-autoinst and qemu-x86 dependencies.
@@ -166,25 +187,33 @@ Convenience package providing os-autoinst + s390 worker jumphost dependencies.
 
 %prep
 %setup -q
-# Replace version number from git to what's reported by the package
-sed  -i 's/ my $thisversion = qx{git.*rev-parse HEAD}.*;/ my $thisversion = "%{version}";/' isotovideo
 
 # don't require qemu within OBS
 # and exclude known flaky tests in OBS check
 # https://progress.opensuse.org/issues/52652
 # 07-commands: https://progress.opensuse.org/issues/60755
 # 29-backend-driver: https://progress.opensuse.org/issues/105061
-for i in 07-commands 13-osutils 14-isotovideo 18-qemu-options 18-backend-qemu 29-backend-driver 99-full-stack; do
+# 29-backend-generalhw: https://progress.opensuse.org/issues/117352
+for i in 07-commands 13-osutils 14-isotovideo 18-qemu-options 18-backend-qemu 29-backend-driver 29-backend-generalhw 99-full-stack; do
     rm t/$i.t
 done
 # exclude unnecessary author tests
 rm xt/00-tidy.t
 # Remove test relying on a git working copy
 rm xt/30-make.t
+# https://progress.opensuse.org/issues/114881
+rm t/27-consoles-vmware.t
+# exclude tests requiring OCR dependencies when those are disabled
+%if %{without ocr}
+rm t/02-test_ocr.t
+%endif
 
 %build
 %define __builder ninja
-%cmake -DOS_AUTOINST_DOC_DIR:STRING="%{_docdir}/%{name}" -DSYSTEMD_SERVICE_DIR:STRING="%{_unitdir}"
+%cmake \
+    -DOS_AUTOINST_DOC_DIR:STRING="%{_docdir}/%{name}" \
+    -DOS_AUTOINST_VERSION:STRING="%{version}" \
+    -DSYSTEMD_SERVICE_DIR:STRING="%{_unitdir}"
 %cmake_build
 
 %install
@@ -204,12 +233,16 @@ export NO_BRP_STALE_LINK_ERROR=yes
 
 %check
 export CI=1
+# set TESSDATA_PREFIX for 02-ocr.t
+export TESSDATA_PREFIX="%{_datadir}/tessdata/"
 # account for sporadic slowness in build environments
 # https://progress.opensuse.org/issues/89059
 export OPENQA_TEST_TIMEOUT_SCALE_CI=20
+# We don't want fatal warnings during package building
+export PERL_TEST_WARNINGS_ONLY_REPORT_WARNINGS=1
 # Enable verbose test output as we can not store test artifacts within package
 # build environments in case of needing to investigate failures
-export PROVE_ARGS="--timer -v"
+export PROVE_ARGS="--timer -v --nocolor"
 cd %{__builddir}
 %cmake_build check-pkg-build
 
@@ -218,6 +251,9 @@ cd %{__builddir}
 
 %post openvswitch
 %service_add_post os-autoinst-openvswitch.service
+if test $1 -eq 1 ; then
+  %{_bindir}/dbus-send --system --type=method_call --dest=org.freedesktop.DBus / org.freedesktop.DBus.ReloadConfig 2>&1 || :
+fi
 
 %preun openvswitch
 %service_del_preun os-autoinst-openvswitch.service
@@ -253,6 +289,11 @@ cd %{__builddir}
 %{_prefix}/lib/os-autoinst/autotest.pm
 %{_prefix}/lib/os-autoinst/*.py
 %{_prefix}/lib/os-autoinst/check_qemu_oom
+%{_prefix}/lib/os-autoinst/dewebsockify
+%{_prefix}/lib/os-autoinst/vnctest
+
+%dir %{_prefix}/lib/os-autoinst/schema
+%{_prefix}/lib/os-autoinst/schema/Wheels-01.yaml
 
 %files openvswitch
 %defattr(-,root,root)

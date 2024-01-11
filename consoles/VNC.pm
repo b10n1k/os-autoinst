@@ -10,18 +10,21 @@ use Crypt::DES;
 use Compress::Raw::Zlib;
 use Carp qw(confess cluck carp croak);
 use Data::Dumper 'Dumper';
-use Try::Tiny;
 use Scalar::Util 'blessed';
+use Encode;
 use OpenQA::Exceptions;
+use consoles::VMWare;
 
 has [qw(description hostname port username password socket name width height depth
       no_endian_conversion  _pixinfo _colourmap _framebuffer _rfb_version screen_on
       _bpp _true_colour _do_endian_conversion absolute ikvm keymap _last_update_received
-      _last_update_requested check_vnc_stalls _vnc_stalled vncinfo old_ikvm dell)];
+      _last_update_requested check_vnc_stalls _vnc_stalled vncinfo old_ikvm dell
+      vmware_vnc_over_ws_url original_hostname)];
 
 our $VERSION = '0.40';
 
-my $MAX_PROTOCOL_VERSION = 'RFB 003.008' . chr(0x0a);    # Max version supported
+my $MAX_PROTOCOL_VERSION = '003.008';
+my $MAX_PROTOCOL_HANDSHAKE = 'RFB ' . $MAX_PROTOCOL_VERSION . chr(0x0a);    # Max version supported
 
 # This line comes from perlport.pod
 my $client_is_big_endian = unpack('h*', pack('s', 1)) =~ /01/ ? 1 : 0;
@@ -115,7 +118,9 @@ my @encodings = (
     },
 );
 
-sub login ($self, $connect_timeout = undef) {
+sub login ($self, $connect_timeout = undef, $timeout = undef) {
+    consoles::VMWare::setup_for_vnc_console($self);
+
     # arbitrary
     my $connect_failure_limit = 2;
 
@@ -132,19 +137,19 @@ sub login ($self, $connect_timeout = undef) {
     my $hostname = $self->hostname || 'localhost';
     my $port = $self->port || 5900;
     my $description = $self->description || 'VNC server';
-    my $local_timeout = $bmwqemu::vars{VNC_CONNECT_TIMEOUT_LOCAL} // 10;
-    my $remote_timeout = $bmwqemu::vars{VNC_CONNECT_TIMEOUT_REMOTE} // 60;
-    $connect_timeout //= ($hostname =~ qr/(localhost|127\.0\.0\.\d+|::1)/) ? $local_timeout : $remote_timeout;
-    my $endtime = time + $connect_timeout;
+    my $is_local = $hostname =~ qr/(localhost|127\.0\.0\.\d+|::1)/;
+    my $local_timeout = $bmwqemu::vars{VNC_TIMEOUT_LOCAL} // 60;
+    my $remote_timeout = $bmwqemu::vars{VNC_TIMEOUT_REMOTE} // 60;
+    my $local_connect_timeout = $bmwqemu::vars{VNC_CONNECT_TIMEOUT_LOCAL} // 20;
+    my $remote_connect_timeout = $bmwqemu::vars{VNC_CONNECT_TIMEOUT_REMOTE} // 240;
+    $connect_timeout //= $is_local ? $local_connect_timeout : $remote_connect_timeout;
+    $timeout //= $is_local ? $local_timeout : $remote_timeout;
 
     my $socket;
     my $err_cnt = 0;
+    my $endtime = time + $connect_timeout;
     while (!$socket) {
-        $socket = IO::Socket::INET->new(
-            PeerAddr => $hostname,
-            PeerPort => $port,
-            Proto => 'tcp',
-        );
+        $socket = IO::Socket::INET->new(PeerAddr => $hostname, PeerPort => $port, Proto => 'tcp', Timeout => $timeout);
         if (!$socket) {
             $err_cnt++;
             my $error_message = "Error connecting to $description <$hostname:$port>: $@";
@@ -157,6 +162,11 @@ sub login ($self, $connect_timeout = undef) {
             next;
         }
         $socket->sockopt(Socket::TCP_NODELAY, 1);    # turn off Naegle's algorithm for vnc
+
+        # set timeout for receiving/sending as the timeout specified via c'tor only applies to connect/accept
+        # note: Using native code to set VNC socket timeout because from C++ we can simply include `struct timeval`
+        #       from `#include <sys/time.h>` instead of relying on unportable manual packing.
+        tinycv::set_socket_timeout($socket->fileno, $timeout) or bmwqemu::fctwarn "Unable to set VNC socket timeout: $!";
     }
     $self->socket($socket);
 
@@ -180,12 +190,10 @@ sub _handshake_protocol_version ($self) {
     die 'Malformed RFB protocol: ' . $protocol_version if $protocol_version !~ m/$protocol_pattern/xms;
     $self->_rfb_version($1);
 
-    if ($protocol_version gt $MAX_PROTOCOL_VERSION) {
-        $protocol_version = $MAX_PROTOCOL_VERSION;
-
+    if ($protocol_version gt $MAX_PROTOCOL_HANDSHAKE) {
+        $protocol_version = $MAX_PROTOCOL_HANDSHAKE;
         # Repeat with the changed version
-        die 'Malformed RFB protocol' unless $protocol_version =~ m/$protocol_pattern/xms;
-        $self->_rfb_version($1);
+        $self->_rfb_version($MAX_PROTOCOL_VERSION);
     }
 
     die 'RFB protocols earlier than v3.3 are not supported' if $self->_rfb_version lt '003.003';
@@ -371,7 +379,7 @@ sub _server_initialization ($self) {
     $self->_pixinfo(\%pixinfo);
     $self->_bpp($supported_depths{$self->depth}->{bpp});
     $self->_true_colour($supported_depths{$self->depth}->{true_colour});
-    $self->_do_endian_conversion($self->no_endian_conversion ? 0 : $server_is_big_endian != $client_is_big_endian);
+    $self->_do_endian_conversion($self->no_endian_conversion ? 0 : ($server_is_big_endian && $client_is_big_endian));
 
     if ($name_length) {
         $socket->read(my $name_string, $name_length)
@@ -545,7 +553,7 @@ my $keymap_ikvm = {
     '/' => 0x38,
 };
 
-sub shift_keys {
+sub shift_keys () {
     # see http://en.wikipedia.org/wiki/IBM_PC_keyboard
     return {
         '~' => '`',
@@ -580,6 +588,10 @@ sub shift_keys {
 
 ## use critic
 
+sub die_on_invalid_mapping ($key) {
+    die decode_utf8 "No map for '$key' - layouts other than en-us are not supported\n";
+}
+
 sub init_x11_keymap ($self) {
     return if $self->keymap;
     # create a deep copy - we want to reuse it in other instances
@@ -598,7 +610,7 @@ sub init_x11_keymap ($self) {
     }
     # VNC doesn't use the unshifted values, only prepends a shift key
     for my $key (keys %{shift_keys()}) {
-        die "no map for $key" unless $keymap{$key};
+        die_on_invalid_mapping($key) unless $keymap{$key};
         $keymap{$key} = [$keymap{shift}, $keymap{$key}];
     }
     $self->keymap(\%keymap);
@@ -620,7 +632,7 @@ sub init_ikvm_keymap ($self) {
     }
     my %map = %{shift_keys()};
     while (my ($key, $shift) = each %map) {
-        die "no map for $key" unless $keymap{$shift};
+        die_on_invalid_mapping($key) unless $keymap{$shift};
         $keymap{$key} = [$keymap{shift}, $keymap{$shift}];
     }
     $self->keymap(\%keymap);
@@ -650,7 +662,7 @@ sub map_and_send_key ($self, $keys, $down_flag, $press_release_delay) {
             next;
         }
         else {
-            die "No map for '$key'";
+            die_on_invalid_mapping($key);
         }
     }
 
@@ -689,26 +701,22 @@ sub send_pointer_event ($self, $button_mask, $x, $y) {
         ));
 }
 
-# drain the VNC socket from all pending incoming messages.  return
-# true if there was a screen update.
+# drain the VNC socket from all pending incoming messages
+# return truthy value if there was a screen update
 sub update_framebuffer ($self) {
-    try {
+    my $have_recieved_update = 0;
+    eval {
         local $SIG{__DIE__} = undef;
-        my $have_recieved_update = 0;
         while (defined(my $message_type = $self->_receive_message())) {
             $have_recieved_update = 1 if $message_type == 0;
         }
-        return $have_recieved_update;
-    }
-    catch {
-        if (blessed $_ && $_->isa('OpenQA::Exception::VNCProtocolError')) {
-            bmwqemu::fctwarn "Error in VNC protocol - relogin: " . $_->error;
-            $self->login;
-        }
-        else {
-            die $_;
-        }
     };
+    if (my $e = $@) {
+        die $e unless blessed $e && $e->isa('OpenQA::Exception::VNCProtocolError');
+        bmwqemu::fctwarn "Error in VNC protocol - relogin: " . $e->error;
+        $self->login;
+    }
+    return $have_recieved_update;
 }
 
 use POSIX ':errno_h';
@@ -815,11 +823,9 @@ sub _receive_update ($self) {
     }
 
     my $socket = $self->socket;
-    my $hlen = $socket->read(my $header, 3) || die 'unexpected end of data';
-    my $number_of_rectangles = unpack('xn', $header);
-    my $depth = $self->depth;
-    my $do_endian_conversion = $self->_do_endian_conversion;
+    $socket->read(my $header, 3) || die 'unexpected end of data';
 
+    my $number_of_rectangles = unpack('xn', $header);
     foreach (my $i = 0; $i < $number_of_rectangles; ++$i) {
         $socket->read(my $data, 12) || die 'unexpected end of data';
         my ($x, $y, $w, $h, $encoding_type) = unpack 'nnnnN', $data;
@@ -830,22 +836,14 @@ sub _receive_update ($self) {
         # work around buggy addrlink VNC
         next if $encoding_type > 0 && $w * $h == 0;
 
-        my $bytes_per_pixel = $self->_bpp / 8;
-
-        ### Raw encoding ###
-        if ($encoding_type == 0 && !$self->ikvm) {
-
-            $socket->read(my $data, $w * $h * $bytes_per_pixel) || die 'unexpected end of data';
-
-            # splat raw pixels into the image
-            my $img = tinycv::new($w, $h);
-
+        if ($encoding_type == 0 && !$self->ikvm) {    # Raw
+            $socket->read(my $data, $w * $h * $self->_bpp / 8) || die 'unexpected end of data';
             $image->map_raw_data($data, $x, $y, $w, $h, $self->vncinfo);
         }
-        elsif ($encoding_type == 16) {
+        elsif ($encoding_type == 16) {    # ZRLE
             $self->_receive_zrle_encoding($x, $y, $w, $h);
         }
-        elsif ($encoding_type == -223) {
+        elsif ($encoding_type == -223) {    # DesktopSize pseudo-encoding
             $self->width($w);
             $self->height($h);
             $image = tinycv::new($self->width, $self->height);
@@ -1035,7 +1033,7 @@ sub _receive_colour_map ($self) {
 }
 
 # Discard the bell signal
-sub _receive_bell { 1 }
+sub _receive_bell ($self) { 1 }
 
 sub _receive_ikvm_session ($self) {
     $self->socket->read(my $ikvm_session_infos, 264);

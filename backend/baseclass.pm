@@ -16,10 +16,11 @@ use File::Copy 'cp';
 use File::Basename;
 use Time::HiRes qw(gettimeofday time tv_interval);
 use Try::Tiny;
-use POSIX qw(_exit :sys_wait_h);
+use POSIX qw(_exit waitpid WNOHANG);
 use IO::Select;
 require IPC::System::Simple;
 use myjsonrpc;
+use needle;
 use Net::SSH2 'LIBSSH2_ERROR_EAGAIN';
 use OpenQA::Benchmark::Stopwatch;
 use MIME::Base64 'encode_base64';
@@ -34,6 +35,7 @@ use OpenQA::NamedIOSelect;
 
 use constant FULL_SCREEN_SEARCH_FREQUENCY => $ENV{OS_AUTOINST_FULL_SCREEN_SEARCH_FREQUENCY} // 5;
 use constant FULL_UPDATE_REQUEST_FREQUENCY => $ENV{OS_AUTOINST_FULL_UPDATE_REQUEST_FREQUENCY} // 5;
+use constant DEFAULT_FFMPEG_CMD => 'ffmpeg -y -hide_banner -nostats -r 24 -f image2pipe -vcodec ppm -i - -pix_fmt yuv420p';
 
 # should be a singleton - and only useful in backend process
 our $backend;
@@ -55,10 +57,12 @@ sub new ($class) {
     $self->{video_frame_number} = 0;
     $self->{video_encoders} = {};
     $self->{external_video_encoder_image_data} = [];
-    $self->{min_image_similarity} = 10000;
-    $self->{min_video_similarity} = 10000;
+    $self->{min_image_similarity} = 10_000;
+    $self->{min_video_similarity} = 10_000;
     $self->{children} = [];
     $self->{ssh_connections} = {};
+    $self->{xres} = $bmwqemu::vars{XRES} // 1024;
+    $self->{yres} = $bmwqemu::vars{YRES} // 768;
 
     return $self;
 }
@@ -128,7 +132,7 @@ sub run ($self, $cmdpipe, $rsppipe) {
 
     $self->run_capture_loop;
 
-    bmwqemu::diag("management process exit at " . POSIX::strftime("%F %T", gmtime));
+    bmwqemu::diag("management process exit at " . POSIX::strftime("%F %T", gmtime));    # uncoverable statement
 }
 
 sub _write_buffered_data_to_file_handle ($self, $program_name, $array_of_buffers, $fh) {
@@ -147,6 +151,40 @@ sub _write_buffered_data_to_file_handle ($self, $program_name, $array_of_buffers
     }
 }
 
+sub _check_for_screen_change ($self, $now) {
+    return undef unless my $wait_screen_change = $self->{_wait_screen_change};
+    my $similiarity_to_reference = $self->similiarity_to_reference(undef);
+    my $elapsed = $similiarity_to_reference->{elapsed} = $now - $wait_screen_change->{starttime};
+    my $screen_changed = $similiarity_to_reference->{sim} < $wait_screen_change->{similarity_level};
+    my $timed_out = $similiarity_to_reference->{timed_out} = $elapsed > $wait_screen_change->{timeout};
+    return undef unless $screen_changed || $timed_out;
+    $self->{_wait_screen_change} = undef;    # no longer waiting for screen change
+    return undef unless $self->{rsppipe};
+    my %reply = (rsp => $similiarity_to_reference, json_cmd_token => $self->{_postponed_cmd_token});
+    myjsonrpc::send_json($self->{rsppipe}, \%reply);
+    return 1;
+}
+
+sub _check_for_still_screen ($self, $now) {
+    return undef unless my $wait_still_screen = $self->{_wait_still_screen};
+    my $similiarity_to_reference = $self->similiarity_to_reference(undef);
+    my $elapsed = $similiarity_to_reference->{elapsed} = $now - $wait_still_screen->{starttime};
+    my $screen_changed = $similiarity_to_reference->{sim} < $wait_still_screen->{similarity_level};
+    my $timed_out = $elapsed > $wait_still_screen->{timeout};
+    my $lastchangetime = \$wait_still_screen->{lastchangetime};
+    if ($screen_changed) {
+        $$lastchangetime = $now;
+        $self->set_reference_screenshot({});
+    }
+    my $is_still = $now - $$lastchangetime >= $wait_still_screen->{stilltime};
+    return undef unless $is_still || $timed_out;
+    $similiarity_to_reference->{timed_out} = $is_still ? 0 : $timed_out;
+    $self->{_wait_still_screen} = undef;    # no longer waiting for still screen
+    my %reply = (rsp => $similiarity_to_reference, json_cmd_token => $self->{_postponed_cmd_token});
+    myjsonrpc::send_json($self->{rsppipe}, \%reply);
+    return 1;
+}
+
 sub do_capture ($self, $timeout = undef, $starttime = undef) {
     # Time slot buckets
     my $buckets = {};
@@ -162,7 +200,13 @@ sub do_capture ($self, $timeout = undef, $starttime = undef) {
             last if $time_to_timeout <= 0;
         }
 
-        my $time_to_update_request = $self->update_request_interval - ($now - $self->last_update_request);
+        # lower the intervals when there is a pending wait command with `no_wait` option
+        # note: Still keeping the interval at 0.1 s to avoid wasting too much CPU (corresponding to what check_screen/assert_screen
+        #       also does).
+        my $pending_wait_command = $self->{_wait_screen_change} || $self->{_wait_still_screen};
+        my @additional_intervals = $pending_wait_command && $pending_wait_command->{no_wait} ? (0.1) : ();
+
+        my $time_to_update_request = min($self->update_request_interval, @additional_intervals) - ($now - $self->last_update_request);
         if ($time_to_update_request <= 0) {
             $self->request_screen_update();
             $self->last_update_request($now);
@@ -177,12 +221,17 @@ sub do_capture ($self, $timeout = undef, $starttime = undef) {
             bmwqemu::fctwarn "There is some problem with your environment, we detected a stall for $diff seconds";
         }
 
-        my $time_to_screenshot = $self->screenshot_interval - ($now - $self->last_screenshot);
+        # capture the screen if screenshot interval exceeded
+        my $screenshot_interval = min($self->screenshot_interval, @additional_intervals);
+        my $time_to_screenshot = $screenshot_interval - ($now - $self->last_screenshot);
         if ($time_to_screenshot <= 0) {
             $self->capture_screenshot();
             $self->last_screenshot($now);
-            $time_to_screenshot = $self->screenshot_interval;
+            $time_to_screenshot = $screenshot_interval;
         }
+
+        # check whether the screen has changed if waiting for a screen change and send back the result
+        $self->_check_for_screen_change($now) or $self->_check_for_still_screen($now);
 
         my $time_to_next = min($time_to_screenshot, $time_to_update_request, $time_to_timeout);
         my ($read_set, $write_set) = IO::Select->select($self->{select_read}->select(), $self->{select_write}->select(), undef, $time_to_next);
@@ -201,9 +250,7 @@ sub do_capture ($self, $timeout = undef, $starttime = undef) {
             else {
                 next if $other;
                 $other = 1;
-                if (!$self->check_socket($fh, 1) && !$other) {
-                    die "huh! $fh\n";
-                }
+                die "error checking socket for write: $fh\n" unless $self->check_socket($fh, 1) || $other;
             }
             last if $video_encoder == 1 && $external_video_encoder == 1 && $other;
         }
@@ -234,9 +281,7 @@ sub do_capture ($self, $timeout = undef, $starttime = undef) {
             }
 
 
-            unless ($self->check_socket($fh, 0)) {
-                die "huh! $fh\n";
-            }
+            die "error checking socket for read: $fh\n" unless $self->check_socket($fh, 0);
             # don't check for further sockets after this one as
             # check_socket can have side effects on the sockets
             # (e.g. console resets), so better take the next socket
@@ -294,16 +339,24 @@ sub check_select_rate ($buckets, $wait_time_limit, $hits_limit, $id, $time) {
 sub _invoke_video_encoder ($self, $pipe_name, $display_name, @cmd) {
     my $pid = open($self->{$pipe_name}, '|-', @cmd);
     my $pipe = $self->{$pipe_name};
-    $self->{video_encoders}->{$pid} = {name => $display_name, pipe => $pipe};
-    $pipe->blocking(0);
+    $self->{video_encoders}->{$pid} = {name => $display_name, pipe => $pipe, cmd => join ' ', @cmd};
+    $pipe->blocking(!!$bmwqemu::vars{VIDEO_ENCODER_BLOCKING_PIPE});
+}
+
+sub _ffmpeg_banner () { qx{ffmpeg 2>&1} // '' }
+
+sub _auto_detect_external_video_encoder ($self) {
+    my $ffmpeg_banner = _ffmpeg_banner;
+    return DEFAULT_FFMPEG_CMD . ' -c:v libsvtav1 -crf 50 -preset 7' if $ffmpeg_banner =~ qr/--enable-libsvtav1(\s|$)/;
+    return DEFAULT_FFMPEG_CMD . ' -c:v libvpx-vp9 -crf 35 -b:v 1500k -cpu-used 1' if $ffmpeg_banner =~ qr/--enable-libvpx(\s|$)/;
 }
 
 sub _start_external_video_encoder_if_configured ($self) {
     return 0 if $bmwqemu::vars{NOVIDEO};
 
-    my $cmd = $bmwqemu::vars{EXTERNAL_VIDEO_ENCODER_CMD} or return 0;
+    my $cmd = $bmwqemu::vars{EXTERNAL_VIDEO_ENCODER_CMD} // $self->_auto_detect_external_video_encoder or return 0;
     my $output_file_name = $bmwqemu::vars{EXTERNAL_VIDEO_ENCODER_OUTPUT_FILE_EXTENSION} // 'webm';
-    my $output_file_path = Cwd::getcwd . "/video.$output_file_name";
+    my $output_file_path = "video.$output_file_name";
     $cmd .= " '$output_file_path'" unless $cmd =~ s/%OUTPUT_FILE_NAME%/$output_file_path/;
 
     bmwqemu::diag "Launching external video encoder: $cmd";
@@ -319,6 +372,7 @@ sub start_encoder ($self) {
     my $cwd = Cwd::getcwd;
     my @cmd = (qw(nice -n 19), "$bmwqemu::scriptdir/videoencoder", "$cwd/video.ogv");
     push(@cmd, '-n') if $bmwqemu::vars{NOVIDEO} || ($has_external_video_encoder_configured && !$bmwqemu::vars{EXTERNAL_VIDEO_ENCODER_ADDITIONALLY});
+    push @cmd, '-x', $self->{xres}, '-y', $self->{yres};
     $self->_invoke_video_encoder(encoder_pipe => 'built-in video encoder', @cmd);
 
     # open file for recording real time clock timestamps as subtitle
@@ -403,13 +457,6 @@ sub stop_vm ($self, @) {
     return;
 }
 
-sub alive ($self, @) {
-    return 0 unless $self->{started};
-    return 1 if $self->file_alive() and $self->raw_alive();
-    bmwqemu::fctwarn("ALARM: backend.run got deleted! - exiting...");
-    _exit(1);
-}
-
 # new api end
 
 # virtual methods
@@ -441,7 +488,7 @@ sub switch_network ($self, $args) { $self->notimplemented }
 
 sub save_memory_dump ($self, $args) { $self->notimplemented }
 
-sub save_storage_drives ($self, $args) { $self->notimplemented }
+sub save_storage ($self, $args) { $self->notimplemented }
 
 ## MAY be overwritten:
 
@@ -467,7 +514,7 @@ sub enqueue_screenshot ($self, $image) {
     my $watch = OpenQA::Benchmark::Stopwatch->new();
     $watch->start();
 
-    $image = $image->scale(1024, 768);
+    $image = $image->scale($self->{xres}, $self->{yres});
     $watch->lap("scaling");
 
     my $lastscreenshot = $self->last_image;
@@ -492,7 +539,7 @@ sub enqueue_screenshot ($self, $image) {
     # into the video
     if ($self->{min_image_similarity} <= 54) {
         $self->last_image($image);
-        $self->{min_image_similarity} = 10000;
+        $self->{min_image_similarity} = 10_000;
     }
 
     my $external_video_encoder_cmd_pipe = $self->{external_video_encoder_cmd_pipe};
@@ -506,7 +553,7 @@ sub enqueue_screenshot ($self, $image) {
         $watch->lap("convert ppm data");
         push(@{$self->{video_frame_data}}, 'E ' . length($imgdata) . "\n");
         push(@{$self->{video_frame_data}}, $imgdata);
-        $self->{min_video_similarity} = 10000;
+        $self->{min_video_similarity} = 10_000;
         push(@{$self->{external_video_encoder_image_data}}, $imgdata)
           if defined $external_video_encoder_cmd_pipe;
     }
@@ -528,6 +575,19 @@ sub enqueue_screenshot ($self, $image) {
     return;
 }
 
+sub wait_screen_change ($self, $args) {
+    $args->{starttime} = gettimeofday;
+    $self->{_wait_screen_change} = $args;
+    return {postponed => 1};
+}
+
+sub wait_still_screen ($self, $args) {
+    $args->{starttime} = $args->{lastchangetime} = gettimeofday;
+    $self->set_reference_screenshot({});
+    $self->{_wait_still_screen} = $args;
+    return {postponed => 1};
+}
+
 sub close_pipes ($self) {
     if ($self->{cmdpipe}) {
         close($self->{cmdpipe}) || die "close $!\n";
@@ -543,7 +603,7 @@ sub close_pipes ($self) {
     myjsonrpc::send_json($self->{rsppipe}, {QUIT => 1});
     close($self->{rsppipe}) || die "close $!\n";
     Devel::Cover::report() if Devel::Cover->can('report');
-    _exit(0);
+    _exit(0);    # uncoverable statement
 }
 
 # this is called for all sockets ready to read from
@@ -553,10 +613,13 @@ sub check_socket ($self, $fh, $write = undef) {
         my $cmd = myjsonrpc::read_json($self->{cmdpipe});
 
         if ($cmd->{cmd}) {
-            my $rsp = {rsp => ($self->handle_command($cmd) // 0)};
-            $rsp->{json_cmd_token} = $cmd->{json_cmd_token};
-            if ($self->{rsppipe}) {    # the command might have closed it
-                myjsonrpc::send_json($self->{rsppipe}, $rsp);
+            my $rsp = ($self->handle_command($cmd) // 0);
+            my $response = {rsp => $rsp};
+            if (ref $rsp eq 'HASH' && $rsp->{postponed}) {
+                $self->{_postponed_cmd_token} = $cmd->{json_cmd_token};
+            } elsif ($self->{rsppipe}) {    # the command might have closed it
+                $response->{json_cmd_token} = $cmd->{json_cmd_token};
+                myjsonrpc::send_json($self->{rsppipe}, $response);
             }
         }
         else {
@@ -623,11 +686,8 @@ sub reset_console ($self, $args) {
 
 sub deactivate_console ($self, $args) {
     my $testapi_console = $args->{testapi_console};
-
     my $console_info = $self->console($testapi_console);
-    if (defined $self->{current_console} && $self->{current_console} == $console_info) {
-        $self->{current_console} = undef;
-    }
+    $self->{current_console} = undef if defined $self->{current_console} && $self->{current_console} == $console_info;
     $console_info->disable();
     return;
 }
@@ -635,18 +695,14 @@ sub deactivate_console ($self, $args) {
 sub disable_consoles ($self) {
     for my $console (keys %{$testapi::distri->{consoles}}) {
         my $console_info = $self->console($console);
-        if ($console_info->can('disable')) {
-            $console_info->disable();
-        }
+        $console_info->disable() if $console_info->can('disable');
     }
 }
 
 sub reenable_consoles ($self) {
     for my $console (keys %{$testapi::distri->{consoles}}) {
         my $console_info = $self->console($console);
-        if ($console_info->{activated} && $console_info->can('disable')) {
-            $console_info->activate();
-        }
+        $console_info->activate() if $console_info->{activated} && $console_info->can('disable');
     }
 }
 
@@ -661,9 +717,7 @@ module after the snapshot.
 sub save_console_snapshots ($self, $name) {
     for my $console (keys %{$testapi::distri->{consoles}}) {
         my $console_info = $self->console($console);
-        if ($console_info->can('save_snapshot')) {
-            $console_info->save_snapshot($name);
-        }
+        $console_info->save_snapshot($name) if $console_info->can('save_snapshot');
     }
 }
 
@@ -676,9 +730,7 @@ in the same state as when the snapshot was taken.
 sub load_console_snapshots ($self, $name) {
     for my $console (keys %{$testapi::distri->{consoles}}) {
         my $console_info = $self->console($console);
-        if ($console_info->can('load_snapshot')) {
-            $console_info->load_snapshot($name);
-        }
+        $console_info->load_snapshot($name) if $console_info->can('load_snapshot');
     }
 }
 
@@ -817,8 +869,7 @@ sub wait_serial ($self, $args) {
     my $matched = 0;
     my $str;
 
-    confess '\'current_console\' is not set' unless $self->{current_console};
-    if ($self->{current_console}->is_serial_terminal) {
+    if ($self->{current_console} && $self->{current_console}->is_serial_terminal) {
         return $self->{current_screen}->read_until($regexp, $timeout, %$args);
     }
 
@@ -856,7 +907,7 @@ sub set_reference_screenshot ($self, $args) {
 }
 
 sub similiarity_to_reference ($self, $args) {
-    return {sim => 10000} if (!$self->reference_screenshot || !$self->last_image);
+    return {sim => 10_000} if (!$self->reference_screenshot || !$self->last_image);
     return {sim => $self->reference_screenshot->similarity($self->last_image)};
 }
 
@@ -1142,10 +1193,10 @@ sub new_ssh_connection ($self, %args) {
             # Check if we still can create channels on that connection
             if (my $tmp_chan = $con->channel()) {
                 $tmp_chan->close();
-                bmwqemu::diag "Use existing SSH connection (key:$connection_key)";
+                bmwqemu::diag "Using existing SSH connection (key:$connection_key)";
                 return $con;
             } else {
-                bmwqemu::diag "Close broken SSH connection (key:$connection_key)";
+                bmwqemu::diag "Closing broken SSH connection (key:$connection_key)";
                 $con->disconnect();
                 delete $self->{ssh_connections}->{$connection_key};
             }
@@ -1162,7 +1213,7 @@ sub new_ssh_connection ($self, %args) {
     while ($counter > 0) {
         if ($ssh->connect($args{hostname}, $args{port})) {
 
-            if ($args{password}) {
+            if (!$args{use_ssh_agent} && defined($args{password})) {
                 $ssh->auth(username => $args{username}, password => $args{password});
             }
             else {
@@ -1251,7 +1302,7 @@ sub run_ssh_cmd ($self, $cmd, %args) {
     my ($ssh, $chan) = $self->run_ssh($cmd, %args);
     $chan->send_eof;
 
-    while (!$chan->eof) {
+    until ($chan->eof) {
         if (my ($o, $e) = $chan->read2) {
             $stdout .= $o;
             $stderr .= $e;
@@ -1262,7 +1313,7 @@ sub run_ssh_cmd ($self, $cmd, %args) {
     bmwqemu::diag("[run_ssh_cmd($cmd)] stderr:$/$stderr") if length($stderr);
     my $ret = $chan->exit_status();
     bmwqemu::diag("[run_ssh_cmd($cmd)] exit-code: $ret");
-    $ssh->disconnect() unless ($args{keep_open});
+    $ssh->disconnect() unless $args{keep_open};
 
     return $args{wantarray} ? ($ret, $stdout, $stderr) : $ret;
 }
@@ -1297,7 +1348,7 @@ sub stop_ssh_serial ($self) {
 }
 
 sub hide_password ($self, %args) {
-    $args{password} = 'SECRET' if ($args{password});
+    $args{password} = 'SECRET' if $args{password};
     return \%args;
 }
 
@@ -1324,7 +1375,7 @@ sub _stop_children_processes ($self) {
             $ret = waitpid($pid, WNOHANG);
             bmwqemu::diag "waitpid for $pid returned $ret";
             last if ($ret == $pid);
-            sleep 1;
+            sleep 1;    # uncoverable statement
         }
     }
 }
@@ -1333,10 +1384,10 @@ sub _child_process ($self, $code) {
     die "Can't spawn child without code" unless ref($code) eq "CODE";
 
     my $pid = fork();
-    die "fork failed" unless defined($pid);
+    die "fork failed" unless defined($pid);    # uncoverable statement
 
     if ($pid == 0) {
-        $code->();
+        $code->();    # uncoverable statement
     }
     else {
         push @{$self->{children}}, $pid;

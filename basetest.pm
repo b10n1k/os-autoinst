@@ -12,13 +12,24 @@ use ocr;
 use testapi ();
 use autotest ();
 use MIME::Base64 'decode_base64';
+use OpenQA::Exceptions;
 use Mojo::File 'path';
 
 my $serial_file_pos = 0;
 my $autoinst_log_pos = 0;
+my $total_result_count = 0;
+
+my $fail_severity = {
+    '' => 0,
+    na => 0,
+    ok => 100,
+    softfail => 200,
+    fail => 300,
+    canceled => 800
+};
 
 # enable strictures and warnings in all tests globally but allow signatures
-sub import {
+sub import ($self, @) {
     strict->import;
     warnings->import;
     warnings->unimport('experimental::signatures');
@@ -100,9 +111,15 @@ Return a hash of flags that are either there or not
 
 =cut
 
-sub test_flags {
-    return {};
-}
+sub test_flags ($self) { {} }
+
+=head2 total_result_count
+
+Returns the total number of results created via the various record methods.
+
+=cut
+
+sub total_result_count () { $total_result_count }
 
 =head2 post_fail_hook
 
@@ -110,9 +127,7 @@ Function is run after test has failed to e.g. recover log files
 
 =cut
 
-sub post_fail_hook {
-    return 1;
-}
+sub post_fail_hook ($self) { 1 }
 
 =head2 _framenumber_to_timerange
 
@@ -121,7 +136,7 @@ Create a media fragment time from a given framenumber
 =cut
 
 sub _framenumber_to_timerange ($frame) {
-    return [sprintf("%.2f", $frame / 24.0), sprintf("%.2f", ($frame + 1) / 24.0)];
+    return defined($frame) ? [sprintf("%.2f", $frame / 24.0), sprintf("%.2f", ($frame + 1) / 24.0)] : undef;
 }
 
 sub record_screenmatch ($self, $img, $match, $tags = [], $failed_needles = [], $frame = undef) {
@@ -235,7 +250,10 @@ sub record_screenfail ($self, %args) {
 }
 
 sub remove_last_result ($self) {
-    --$self->{test_count};
+    if ($self->{test_count} > 0) {
+        --$total_result_count;
+        --$self->{test_count};
+    }
     return pop @{$self->{details}};
 }
 
@@ -289,6 +307,8 @@ sub post_run_hook ($self) {
 }
 
 sub run_post_fail ($self, $msg) {
+    my $name = $self->{name};
+    autotest::query_isotovideo(set_current_test => {name => $name, full_name => ($self->{fullname} // $name) . ' (post fail hook)'});
     my $post_fail_hook_start_time = time;
     unless ($bmwqemu::vars{_SKIP_POST_FAIL_HOOKS}) {
         $self->{post_fail_hook_running} = 1;
@@ -308,7 +328,7 @@ sub run_post_fail ($self, $msg) {
     die $msg . "\n";
 }
 
-sub execution_time { time - shift }
+sub execution_time ($now) { time - $now }
 
 sub compute_test_execution_time ($self) {
     # Set the execution time for a general time spent
@@ -319,7 +339,7 @@ sub compute_test_execution_time ($self) {
 sub runtest ($self) {
     $self->{test_start_time} = time;
 
-    my $died;
+    my ($died, $error_message, $ignore_error);
     my $name = $self->{name};
     # Set flags to the field value
     $self->{flags} = $self->test_flags();
@@ -333,7 +353,7 @@ sub runtest ($self) {
         }
         $self->post_run_hook();
     };
-    if ($@) {
+    if ($error_message = $@) {
         # copy the exception early
         my $internal = Exception::Class->caught('OpenQA::Exception::InternalException');
 
@@ -354,16 +374,22 @@ sub runtest ($self) {
     eval { $self->search_for_expected_serial_failures(); };
     # Process serial detection failure
     if ($@) {
-        bmwqemu::diag($@);
+        bmwqemu::diag($error_message = $@);
         $self->record_resultfile('Failed', $@, result => 'fail');
         $died = 1;
     }
 
-    $self->run_post_fail("test $name died") if ($died);
+    # pause the test execution if tests are supposed to pause on failures via developer mode, possibly ignore error
+    if ($error_message && autotest::pause_on_failure("test died: $error_message")->{ignore_failure}) {
+        bmwqemu::diag($died
+            ? 'ignoring previously logged failure via developer mode'
+            : "ignoring failure via developer mode: $error_message");
+        $ignore_error = 1;
+    }
 
-    if (($self->{result} || '') eq 'fail') {
-        # fatal
-        $self->run_post_fail("test $name failed");
+    if (!$ignore_error) {
+        $self->run_post_fail("test $name died") if $died;
+        $self->run_post_fail("test $name failed") if ($self->{result} || '') eq 'fail';
     }
 
     $self->compute_test_execution_time();
@@ -386,19 +412,25 @@ sub save_test_result ($self) {
     return $result;
 }
 
+sub _increment_test_count ($self, $max = $bmwqemu::vars{MAX_TEST_STEPS} // 50_000) {
+    if ($total_result_count >= $max) {
+        my $msg = "Maximum allowed test steps (MAX_TEST_STEPS=$max) exceeded";
+        $self->{fatal_failure} = 1;
+        bmwqemu::serialize_state(component => 'tests', msg => $msg, result => 'incomplete');
+        OpenQA::Exception::InternalException->throw(error => $msg);
+    }
+    ++$total_result_count;
+    ++$self->{test_count};
+}
+
 sub next_resultname ($self, $type, $name = undef) {
     my $testname = $self->{name};
-    my $count = ++$self->{test_count};
-    if ($name) {
-        return "$testname-$count.$name.$type";
-    }
-    else {
-        return "$testname-$count.$type";
-    }
+    my $count = $self->_increment_test_count;
+    return $name ? "$testname-$count.$name.$type" : "$testname-$count.$type";
 }
 
 sub write_resultfile ($self, $filename, $output) {
-    path(bmwqemu::result_dir(), $filename)->spurt($output);
+    path(bmwqemu::result_dir(), $filename)->spew($output);
 }
 
 =head2 record_resultfile
@@ -479,9 +511,9 @@ sub record_testresult ($self, $result = undef, %args) {
     }
 
     # add detail
+    $self->_increment_test_count;
     my $detail = {result => $result};
     push(@{$self->{details}}, $detail);
-    ++$self->{test_count};
     return $detail;
 }
 
@@ -519,7 +551,7 @@ sub take_screenshot ($self, $res = undef) {
     my $result = $self->record_testresult($res);
     $self->_result_add_screenshot($result);
 
-    # prevent adding incomplete result to details in case not image was available
+    # prevent adding incomplete result to details in case no image was available
     $self->remove_last_result() unless ($result->{screenshot});
 
     return $result;
@@ -584,22 +616,7 @@ Return a listref containing hashrefs like this:
 
 =cut
 
-sub ocr_checklist {
-    return [];
-}
-
-sub standstill_detected ($self, $lastscreenshot) {
-    $self->record_screenfail(
-        img => $lastscreenshot,
-        result => 'fail',
-        overall => 'fail'
-    );
-
-    testapi::send_key('alt-sysrq-w');
-    testapi::send_key('alt-sysrq-l');
-    testapi::send_key('alt-sysrq-d');    # only available with CONFIG_LOCKDEP
-    return;
-}
+sub ocr_checklist () { [] }
 
 # this is called if the test failed and the framework loaded a VM
 # snapshot - all consoles activated in the test's run function loose their
@@ -664,9 +681,11 @@ sub parse_serial_output_qemu ($self) {
                 elsif ($type =~ 'hard|fatal') {
                     $die = 1;
                     $fail_type = 'fail';
-                    $self->{fatal_failure} = $type eq 'fatal';
+                    $self->{fatal_failure} |= $type eq 'fatal';
                 }
                 $self->record_resultfile($message, $message . " - Serial error: $line", result => $fail_type);
+                # don't make overall result better - only worse
+                next if (defined($self->{result}) && ($fail_severity->{$self->{result}} // 999) > $fail_severity->{$fail_type});
                 $self->{result} = $fail_type;
             }
         }

@@ -16,7 +16,7 @@ sub new ($class) {
 }
 
 sub ipmi_cmdline ($self) {
-    $bmwqemu::vars{"IPMI_$_"} or die 'Need variable IPMI_$_' foreach qw(HOSTNAME USER PASSWORD);
+    $bmwqemu::vars{"IPMI_$_"} or die "Need variable IPMI_$_" for qw(HOSTNAME USER PASSWORD);
     return ('ipmitool', '-I', 'lanplus', '-H', $bmwqemu::vars{IPMI_HOSTNAME}, '-U', $bmwqemu::vars{IPMI_USER}, '-P', $bmwqemu::vars{IPMI_PASSWORD});
 }
 
@@ -32,7 +32,7 @@ sub ipmitool ($self, $cmd, %args) {
     my @tries = (1 .. $args{tries});
     for (@tries) {
         $ret = IPC::Run::run(\@cmd, \$stdin, \$stdout, \$stderr);
-        if ($ret == 0) {
+        if ($ret) {
             $self->dell_sleep;
             last;
         } else {
@@ -41,8 +41,9 @@ sub ipmitool ($self, $cmd, %args) {
     }
     chomp $stdout;
     chomp $stderr;
+    # Output error message with ipmi password masked
+    die join(' ', map { $_ eq $bmwqemu::vars{IPMI_PASSWORD} ? "[masked]" : $_ } @cmd) . ": $stderr" unless ($ret);
 
-    die join(' ', @cmd) . ": $stderr" unless ($ret);
     bmwqemu::diag("IPMI: $stdout");
     return $stdout;
 }
@@ -127,7 +128,7 @@ sub do_mc_reset ($self) {
     }
 
     # during the eval execution of following commands, SIG{__DIE__} will definitely be triggered, let it go
-    local $SIG{__DIE__} = {};
+    local $SIG{__DIE__} = sub { };
 
     # mc reset cmd should return immediately, try maximum 5 times to ensure cmd executed
     my $max_tries = $bmwqemu::vars{IPMI_MC_RESET_MAX_TRIES} // 5;
@@ -156,10 +157,10 @@ sub do_mc_reset ($self) {
                         return;
                     }
                 }
-                sleep 3;
+                sleep 3;    # uncoverable statement
             }
         }
-        sleep 3;
+        sleep 3;    # uncoverable statement
     }
 
     die "IPMI mc reset failure after $max_tries tries! Exit...";

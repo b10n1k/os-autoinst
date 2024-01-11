@@ -6,7 +6,7 @@ use Mojo::Base -strict, -signatures;
 use FindBin '$Bin';
 use lib "$Bin/../external/os-autoinst-common/lib";
 use OpenQA::Test::TimeLimit '5';
-use Test::Output qw(stderr_like combined_from);
+use Test::Output qw(stderr_like combined_from output_like combined_like);
 use Test::Exception;
 use Test::Fatal;
 use Test::Warnings qw(:report_warnings warning);
@@ -29,7 +29,7 @@ like warning {
   qr/loadtest needs a script below.*is not/,
   'loadtest outputs on stderr';
 
-sub loadtest ($test, $msg = undef) {
+sub loadtest ($test, $msg = "loadtest($test)") {
     my $filename = $test =~ /\.p[my]$/ ? $test : $test . '.pm';
     $test =~ s/\.p[my]//;
     stderr_like { autotest::loadtest "tests/$filename" } qr@scheduling $test#?[0-9]* tests/$test|$test already scheduled@, $msg;
@@ -90,6 +90,7 @@ is($completed, 1, 'start+next+start should complete');
 # Test loading snapshots with always_rollback flag. Have to put it here, before loading
 # runargs test module, as it fails.
 my ($reverts_done, $snapshots_made) = (0, 0);
+# uncoverable statement count:2
 $mock_autotest->redefine(load_snapshot => sub { $reverts_done++ });
 $mock_autotest->redefine(make_snapshot => sub { $snapshots_made++ });
 $mock_autotest->redefine(query_isotovideo => 0);
@@ -133,7 +134,7 @@ subtest 'test always_rollback flag' => sub {
         ($died, $completed) = get_tests_done;
         is $died, 0, 'start+next+start should not die when always_rollback flag is set';
         is $completed, 1, 'start+next+start should complete when always_rollback flag is set';
-        is $reverts_done, 2, 'snapshots are loaded even when tests succeed';
+        is $reverts_done, 1, 'snapshots are loaded even when tests succeed';
         is $snapshots_made, 2, 'milestone snapshots are made for all except the last';
     };
     snapshot_subtest 'snapshot loading with milestone flag and fatal test' => sub {
@@ -314,14 +315,70 @@ subtest 'load test successfully when CASEDIR is a relative path' => sub {
     like warning { loadtest 'start' }, qr{Subroutine run redefined}, 'We get a warning for loading a test a second time';
 };
 
-stderr_like {
-    lives_ok { autotest::loadtest('tests/test.py') } 'can load test module'
-} qr{scheduling test tests/test.py}, 'python test module referenced';
-loadtest 'test.py', 'we can also parse python test modules';
+subtest python => sub {
+    combined_like {
+        lives_ok { autotest::loadtest('tests/pythontest.py') } 'can load test module'
+    } qr{Using python version.*scheduling pythontest tests/pythontest}s, 'python pythontest module referenced';
 
-stderr_like {
-    throws_ok { autotest::loadtest 'tests/faulty.py' } qr/py_eval raised an exception/, 'dies on Python exception';
-} qr/Traceback.*No module named.*thismoduleshouldnotexist.*/s, 'Python traceback logged';
+    %autotest::tests = ();
+    loadtest 'pythontest.py';
+    loadtest 'morepython.py';
+    my $p1 = $autotest::tests{'tests-pythontest'};
+    my $p2 = $autotest::tests{'tests-morepython'};
+    stderr_like { $p1->runtest } qr{This is pythontest.py}, 'Expected output from pythontest.py';
+    stderr_like { $p2->runtest } qr{This is morepython.py}, 'Expected output from morepython.py';
+    is $bmwqemu::vars{HELP}, 'I am a python script trapped in a perl script!', 'set_var() works';
+
+    stderr_like {
+        throws_ok { autotest::loadtest 'tests/faulty.py' } qr/py_eval raised an exception/, 'dies on Python exception';
+    } qr/Traceback.*No module named.*thismoduleshouldnotexist.*/s, 'Python traceback logged';
+};
+
+subtest 'python run_args' => sub {
+    %autotest::tests = ();
+    my $targs = OpenQA::Test::RunArgs->new();
+    $targs->{data} = 23;
+
+    eval { autotest::loadtest('tests/pythontest_with_runargs.py', run_args => $targs); };
+    like($@, qr/run_args is not supported in Python test modules/, 'error message mentions run_args and python');
+};
+
+subtest 'python with bad run method' => sub {
+    %autotest::tests = ();
+    my $targs = OpenQA::Test::RunArgs->new();
+    $targs->{data} = 23;
+
+    my @msg;
+    $mock_bmwqemu->mock(diag => sub ($message) { push @msg, $message });
+    autotest::loadtest('tests/pythontest_with_bad_run_fn.py');
+    is $msg[0], 'scheduling pythontest_with_bad_run_fn tests/pythontest_with_bad_run_fn.py', 'debug message from autotest';
+    $mock_bmwqemu->unmock('diag');
+
+    loadtest 'pythontest_with_bad_run_fn.py';
+    my $p1 = $autotest::tests{'tests-pythontest_with_bad_run_fn'};
+
+    stderr_like {
+        throws_ok(sub { $p1->runtest }, qr{test pythontest_with_bad_run_fn died}, "expected failure on python side");
+    } qr{TypeError: run\(\) takes 0 positional arguments but 1 was given}, 'Expected output from pythontest_with_bad_runargs.py';
+    is $bmwqemu::vars{PY_SUPPORT_FN_NOT_CALLED}, undef, 'set_var() was never called';
+};
+
+subtest 'pausing on failure' => sub {
+    my $autotest_mock = Test::MockModule->new('autotest');
+    my %isotovideo_rsp = (ignore_failure => 1);
+    my @isotovideo_calls;
+    $autotest_mock->redefine(query_isotovideo => sub (@args) { push @isotovideo_calls, \@args; \%isotovideo_rsp });
+    my $rsp = autotest::pause_on_failure('some reason', 'relevant command');
+    is_deeply $rsp, \%isotovideo_rsp, 'response from isotovideo returned';
+    is $isotovideo_calls[0]->[0], 'pause_test_execution', 'isotovideo called to pause test execution';
+    autotest::pause_on_failure('some reason');
+    is scalar @isotovideo_calls, 2, 'isotovideo called again just after failing command because failure was ignored';
+    undef $isotovideo_rsp{ignore_failure};
+    autotest::pause_on_failure('another reason', 'relevant command');
+    is scalar @isotovideo_calls, 3, 'isotovideo called again after a command failed';
+    autotest::pause_on_failure('another reason');
+    is scalar @isotovideo_calls, 3, 'isotovideo not called after tests died because previous command failure was not ignored';
+};
 
 done_testing();
 

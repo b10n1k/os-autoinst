@@ -1,4 +1,4 @@
-# Copyright 2018 SUSE LLC
+# Copyright SUSE LLC
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 package OpenQA::Isotovideo::NeedleDownloader;
@@ -100,10 +100,10 @@ sub _download_file ($self, $download) {
     return unless ($download_res);
     try {
         unlink($download_target);
-        path($download_target)->spurt($download_res->body);
+        path($download_target)->spew($download_res->body);
     }
     catch {
-        bmwqemu::diag("unable to store download under $download_target");
+        bmwqemu::diag("unable to store download under $download_target: $_");
     };
 }
 

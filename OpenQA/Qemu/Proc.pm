@@ -40,19 +40,19 @@ use constant STATE_FILE => 'qemu_state.json';
 
 has qemu_bin => 'qemu-kvm';
 has qemu_img_bin => 'qemu-img';
-has _process => sub { process(
+has _process => sub (@) { process(
         pidfile => 'qemu.pid',
         separate_err => 0,
         blocking_stop => 1) };
 
-has _static_params => sub { return []; };
-has _mut_params => sub { return []; };
+has _static_params => sub ($) { [] };
+has _mut_params => sub ($) { [] };
 
-sub _push_mut { push(@{shift->_mut_params}, shift); }
+sub _push_mut ($key, $value) { push(@{$key->_mut_params}, $value) }
 
-has controller_conf => sub { return OpenQA::Qemu::ControllerConf->new(); };
-has blockdev_conf => sub { return OpenQA::Qemu::BlockDevConf->new(); };
-has snapshot_conf => sub { return OpenQA::Qemu::SnapshotConf->new(); };
+has controller_conf => sub ($) { OpenQA::Qemu::ControllerConf->new() };
+has blockdev_conf => sub ($) { return OpenQA::Qemu::BlockDevConf->new() };
+has snapshot_conf => sub ($) { return OpenQA::Qemu::SnapshotConf->new() };
 
 sub new ($class, @args) {
     my $self = $class->SUPER::new(@args);
@@ -74,7 +74,7 @@ sub static_param ($self, @args) {
         push(@{$self->_static_params}, '-' . $args[0]);
     }
     else {
-        gen_params(@{$self->_static_params}, shift @args, shift @args, @args);
+        gen_params($self->_static_params, shift @args, shift @args, @args);
     }
 }
 
@@ -95,7 +95,8 @@ sub configure_controllers ($self, $vars) {
     }
 
     if ($vars->{CDMODEL} eq 'scsi-cd' || $vars->{HDDMODEL} eq 'scsi-hd') {
-        $vars->{SCSICONTROLLER} ||= "virtio-scsi-pci";
+        my $is_s390x = ($vars->{ARCH} // '') eq 's390x';
+        $vars->{SCSICONTROLLER} ||= $is_s390x ? 'virtio-scsi' : 'virtio-scsi-pci';
     }
 
     my $scsi_con = $vars->{SCSICONTROLLER} || 0;
@@ -178,7 +179,7 @@ sub configure_blockdevs ($self, $bootfrom, $basedir, $vars) {
             $drive = $bdc->add_new_drive($node_id, $hdd_model, $size, $num_queues);
         }
 
-        if ($i == 1 && $bootfrom eq 'disk') {
+        if ($i == 1 && ($bootfrom eq 'disk' || $vars->{PXEBOOT})) {
             $drive->bootindex(0);
         }
 
@@ -338,28 +339,6 @@ sub export_blockdev_images ($self, $filter, $img_dir, $name, $qemu_compress_qcow
     return $count;
 }
 
-=head3 gen_runfile
-
-Create a shell script which will execute QEMU with the same parameters which
-we are using.
-
-=cut
-sub gen_runfile ($self) {
-    open(my $cmdfd, '>', 'runqemu');
-    print $cmdfd "#!/bin/bash\n";
-    my @args;
-    for my $arg ($self->_static_params) {
-        $arg =~ s,\\,\\\\,g;
-        $arg =~ s,\$,\\\$,g;
-        $arg =~ s,\",\\\",g;
-        $arg =~ s,\`,\\\`,;
-        push(@args, "\"$arg\"");
-    }
-    printf $cmdfd "%s \\\n  %s \\\n  \"\$@\"\n", $self->qemu_bin, join(" \\\n  ", @args);
-    close $cmdfd;
-    chmod 0755, 'runqemu';
-}
-
 sub exec_qemu ($self) {
     my @params = $self->gen_cmdline();
     session->enable;
@@ -395,9 +374,9 @@ sub stop_qemu ($self) {
     $self->_process->stop;
 }
 
-sub qemu_pid { shift->_process->process_id }
+sub qemu_pid ($process) { $process->_process->process_id }
 
-sub check_qemu_oom { system("$bmwqemu::scriptdir/check_qemu_oom " . shift->qemu_pid); }    # uncoverable statement
+sub check_qemu_oom ($process) { system("$bmwqemu::scriptdir/check_qemu_oom " . $process->qemu_pid) }    # uncoverable statement
 
 =head3 connect_qmp
 
@@ -409,9 +388,9 @@ sub connect_qmp ($self) {
     my $sk;
     osutils::attempt {
         attempts => $ENV{QEMU_QMP_CONNECT_ATTEMPTS} // 20,
-        condition => sub { $sk },
-        or => sub { die "Can't open QMP socket" },
-        cb => sub {
+        condition => sub () { $sk },
+        or => sub () { die "Can't open QMP socket" },
+        cb => sub () {
             die "QEMU terminated before QMP connection could be established. Check for errors below\n" if $self->{_qemu_terminated};
             $sk = IO::Socket::UNIX->new(
                 Type => IO::Socket::UNIX::SOCK_STREAM,
@@ -438,8 +417,7 @@ sub revert_to_snapshot ($self, $name) {
     my $bdc = $self->blockdev_conf;
 
     my $snapshot = $self->snapshot_conf->revert_to_snapshot($name);
-    $bdc->for_each_drive(sub {
-            my $drive = shift;
+    $bdc->for_each_drive(sub ($drive) {
             my $del_files = $bdc->revert_to_snapshot($drive, $snapshot);
 
             die "Snapshot $name not found for " . $drive->id unless defined($del_files);
@@ -476,7 +454,7 @@ Save our object model of QEMU to a file.
 sub save_state ($self) {
     if ($self->has_state) {
         bmwqemu::fctinfo('Saving QEMU state to ' . STATE_FILE);
-        path(STATE_FILE)->spurt($self->serialise_state());
+        path(STATE_FILE)->spew($self->serialise_state());
     } else {
         bmwqemu::fctinfo('Refusing to save an empty state file to avoid overwriting a useful one');
     }

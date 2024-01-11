@@ -5,16 +5,18 @@ package OpenQA::Isotovideo::CommandHandler;
 use Mojo::Base 'Mojo::EventEmitter', -signatures;
 
 use bmwqemu;
-use testapi 'diag';
+use log qw(diag fctwarn);
 use OpenQA::Isotovideo::Interface;
+use OpenQA::Isotovideo::NeedleDownloader;
 use Cpanel::JSON::XS;
 use Mojo::File 'path';
+use Time::HiRes qw(gettimeofday tv_interval);
 
 use constant AUTOINST_STATUSFILE => 'autoinst-status.json';
 
 
 # io handles for sending data to command server and backend
-has [qw(cmd_srv_fd backend_fd answer_fd)] => undef;
+has [qw(test_fd cmd_srv_fd backend_fd backend_out_fd answer_fd)] => undef;
 
 # the name of the current test (full name includes category prefix, eg. installation-)
 has [qw(current_test_name current_test_full_name)];
@@ -32,6 +34,8 @@ has pause_test_name => sub { $bmwqemu::vars{PAUSE_AT} };
 has pause_on_screen_mismatch => sub { $bmwqemu::vars{PAUSE_ON_SCREEN_MISMATCH} };
 # (set to 'assert_screen' or 'check_screen' where 'check_screen' includes 'assert_screen')
 has pause_on_next_command => sub { $bmwqemu::vars{PAUSE_ON_NEXT_COMMAND} // 0 };
+# (set to 0 or 1)
+has pause_on_failure => sub { $bmwqemu::vars{PAUSE_ON_FAILURE} // 0 };
 # (set to 0 or 1)
 
 # the reason why the test execution has paused or 0 if not paused
@@ -52,6 +56,15 @@ has backend_requester => undef;
 
 # whether the test has already been completed and whether it has died
 has [qw(test_completed test_died)] => 0;
+
+# the time of the last asserted screen
+has [qw(last_check_seconds last_check_microseconds)] => 0;
+
+sub new ($class, @args) {
+    my $self = $class->SUPER::new(@args);
+    $self->_update_last_check;
+    return $self;
+}
 
 sub clear_tags_and_timeout ($self) {
     $self->tags(undef);
@@ -192,6 +205,22 @@ sub _handle_command_set_pause_on_next_command ($self, $response, @) {
     $self->_respond_ok();
 }
 
+sub _handle_command_set_pause_on_failure ($self, $response, @) {
+    my $set_pause_on_failure = ($response->{flag} ? 1 : 0);
+    $self->pause_on_failure($set_pause_on_failure);
+    $self->_send_to_cmd_srv({set_pause_on_failure => $set_pause_on_failure});
+    $self->_respond_ok();
+}
+
+sub _handle_command_pause_test_execution ($self, $response, @) {
+    return $self->_respond_ok if $self->reason_for_pause;    # do nothing if already paused
+    return $self->_respond_ok if $response->{due_to_failure} && !$self->pause_on_failure;
+    my $reason_for_pause = $response->{reason} // 'manually paused';
+    $self->reason_for_pause($reason_for_pause);
+    $self->_send_to_cmd_srv({paused => 1, reason => $reason_for_pause});
+    $self->postponed_answer_fd($self->answer_fd)->postponed_command(undef);
+}
+
 sub _handle_command_resume_test_execution ($self, $response, @) {
     my $postponed_command = $self->postponed_command;
     my $postponed_answer_fd = $self->postponed_answer_fd;
@@ -217,7 +246,7 @@ sub _handle_command_resume_test_execution ($self, $response, @) {
     # if no command has been postponed (because paused due to timeout or on set_current_test) just return 1
     if (!$postponed_command) {
         myjsonrpc::send_json($postponed_answer_fd, {
-                ret => 1,
+                ret => ($response->{options} // 1),
                 new_needles => $response->{new_needles},
         });
         $self->postponed_answer_fd(undef);
@@ -309,6 +338,7 @@ sub _handle_command_status ($self, $response, @) {
             pause_test_name => $self->pause_test_name,
             pause_on_screen_mismatch => ($self->pause_on_screen_mismatch // Mojo::JSON->false),
             pause_on_next_command => $self->pause_on_next_command,
+            pause_on_failure => $self->pause_on_failure,
             test_execution_paused => $self->reason_for_pause,
             devel_mode_major_version => $OpenQA::Isotovideo::Interface::developer_mode_major_version,
             devel_mode_minor_version => $OpenQA::Isotovideo::Interface::developer_mode_minor_version,
@@ -346,8 +376,46 @@ sub update_status_file ($self) {
     my $json = $coder->encode($data);
 
     my $tmp = AUTOINST_STATUSFILE . ".$$.tmp";
-    path($tmp)->spurt($json);
+    path($tmp)->spew($json);
     rename $tmp, AUTOINST_STATUSFILE or die $!;
+}
+
+sub _calc_check_delta ($self) {
+    # an estimate of eternity
+    my $delta = $self->last_check_seconds ? tv_interval([$self->last_check_seconds, $self->last_check_microseconds]) : 100;
+    # sleep the remains of one second if $delta > 0
+    my $timeout = $delta > 0 ? 1 - $delta : 0;
+    $self->timeout($timeout < 0 ? 0 : $timeout);
+    return $delta;
+}
+
+sub _update_last_check ($self) {
+    my ($last_check_seconds, $last_check_microseconds) = gettimeofday;
+    $self->last_check_seconds($last_check_seconds);
+    $self->last_check_microseconds($last_check_microseconds);
+}
+
+sub check_asserted_screen ($self) {
+    if ($self->no_wait) {
+        # prevent CPU overload by waiting at least a little bit
+        $self->timeout(0.1);
+    }
+    else {
+        $self->_calc_check_delta;
+        # come back later, avoid too often called function
+        return if $self->timeout > 0.05;
+    }
+    $self->_update_last_check;
+    my $rsp = $bmwqemu::backend->_send_json({cmd => 'check_asserted_screen'}) || {};
+    # the test needs that information
+    $rsp->{tags} = $self->tags;
+    if ($rsp->{found} || $rsp->{timeout}) {
+        myjsonrpc::send_json($self->test_fd, {ret => $rsp});
+        $self->clear_tags_and_timeout();
+    }
+    else {
+        $self->_calc_check_delta unless $self->no_wait;
+    }
 }
 
 1;

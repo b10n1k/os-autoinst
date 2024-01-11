@@ -13,7 +13,6 @@ sub new ($class, @) {
     $self->{consoles} = {};
     $self->{serial_failures} = [];
     $self->{autoinst_failures} = [];
-    $self->{script_run_die_on_timeout} = -1;
 
 =head2 serial_term_prompt
 
@@ -30,9 +29,8 @@ prompt in \Q and \E anyway otherwise the whitespace will be ignored.
     return $self;
 }
 
-sub init {
-    # no cmds on default distri
-}
+# no cmds on default distri
+sub init ($self) { }
 
 sub add_console ($self, $testapi_console, $backend_console, $backend_args = undef) {
     my %class_names = (
@@ -62,8 +60,8 @@ sub add_console ($self, $testapi_console, $backend_console, $backend_args = unde
     return $ret;
 }
 
-sub x11_start_program {
-    die "TODO: implement x11_start_program for your distri " . testapi::get_var('DISTRI');
+sub x11_start_program (@) {
+    die "TODO: implement x11_start_program for your distri " . testapi::get_var('DISTRI', '');
 }
 
 sub ensure_installed ($self, @pkglist) {
@@ -74,17 +72,17 @@ sub ensure_installed ($self, @pkglist) {
         testapi::x11_start_program("su -c 'yum -y install @pkglist'", 4, {terminal => 1});
     }
     else {
-        die "TODO: implement 'ensure_installed' for your distri " . testapi::get_var('DISTRI');
+        die "TODO: implement 'ensure_installed' for your distri " . testapi::get_var('DISTRI', '');
     }
     if ($testapi::password) { testapi::type_password; testapi::send_key("ret", 1); }
     wait_still_screen(7, 90);    # wait for install
 }
 
 sub become_root ($self) {
-    testapi::script_sudo("bash", 0);    # become root
-    testapi::script_run('test $(id -u) -eq 0 && echo "imroot" > /dev/' . $testapi::serialdev, 0);
-    testapi::wait_serial("imroot", 5) || die "Root prompt not there";
-    testapi::script_run("cd /tmp");
+    testapi::script_sudo('bash', 0);    # become root
+    testapi::enter_cmd('test $(id -u) -eq 0 && echo "imroot" > /dev/' . $testapi::serialdev, 0);
+    testapi::wait_serial('imroot') || die 'Root prompt not there';
+    testapi::enter_cmd('cd /tmp');
 }
 
 =head2 script_run

@@ -8,10 +8,17 @@ use lib "$Bin/../external/os-autoinst-common/lib";
 use OpenQA::Test::TimeLimit '5';
 use Test::MockModule;
 use Test::Fatal;
-use Test::Output qw(combined_like);
+use Test::Output qw(combined_like combined_from);
 use File::Basename;
-use Mojo::File 'tempdir';
+use Mojo::File qw(path tempdir);
+use Mojo::JSON qw(decode_json);
 use Mojo::Util qw(scope_guard);
+use MIME::Base64 'encode_base64';
+use cv;
+use basetest;
+
+cv::init;
+require tinycv;
 
 my $dir = tempdir("/tmp/$FindBin::Script-XXXX");
 chdir $dir;
@@ -22,7 +29,7 @@ use basetest;
 use needle;
 
 # define 'write_with_thumbnail' to fake image
-sub write_with_thumbnail { }
+sub write_with_thumbnail (@) { }
 
 # Anything added to $serial_buffer will be returned by the next call
 # to read_serial, used e.g. by basetest::get_new_serial_output.
@@ -32,6 +39,11 @@ my $cmds;
 my $jsonmod = Test::MockModule->new('myjsonrpc');
 $autotest::isotovideo = 1;
 
+my $last_screenshot_data;
+my $fake_ignore_failure;
+my $suppress_match;
+my @reset_consoles;
+my @selected_consoles;
 sub fake_send_json ($to_fd, $cmd) { push(@$cmds, $cmd) }
 sub fake_read_json ($fd) {
     my $lcmd = $cmds->[-1];
@@ -42,14 +54,33 @@ sub fake_read_json ($fd) {
             position => length($serial_buffer),
         };
     }
-    else {
-        note "mock method not implemented \$cmd: $cmd\n";
+    elsif ($cmd eq 'backend_verify_image') {
+        return {ret => {found => {needle => {name => 'foundneedle', file => 'foundneedle.json'}, area => [{x => 1, y => 2, similarity => 100}]}, candidates => []}} unless $suppress_match;
+        return {};
+    }
+    elsif ($cmd eq 'backend_reset_console') {
+        push @reset_consoles, $lcmd;
+        return {};
+    }
+    elsif ($cmd eq 'backend_select_console') {
+        push @selected_consoles, $lcmd;
+        return {};
+    }
+    elsif ($cmd eq 'backend_last_screenshot_data') {
+        return {} unless $last_screenshot_data;
+        return {ret => {image => $last_screenshot_data, frame => 1}};
+    }
+    elsif ($cmd eq 'pause_test_execution') {
+        return {ret => {ignore_failure => $fake_ignore_failure}};
     }
     return {};
 }
 
 $jsonmod->redefine(send_json => \&fake_send_json);
 $jsonmod->redefine(read_json => \&fake_read_json);
+
+my $mock_bmwqemu = Test::MockModule->new('bmwqemu');
+$mock_bmwqemu->noop('log_call');
 
 subtest run_post_fail_test => sub {
     my $basetest_class = 'basetest';
@@ -63,13 +94,27 @@ subtest run_post_fail_test => sub {
             category => 'category1',
             execute_time => 42,
     }, $basetest_class);
-    combined_like { dies_ok { $basetest->runtest } 'run_post_fail end up with die' } qr/Test died/, 'test died';
-    combined_like { dies_ok { $basetest->runtest } 'post fail hooks runtime' } qr/post fail hooks runtime:/,
-      'Post fail hooks runtime present';
+    my $logs = combined_from { dies_ok { $basetest->runtest } 'run_post_fail end up with die' };
+    like $logs, qr/Test died/, 'test died';
+    like $logs, qr/post fail hooks runtime:/, 'post fail hook ran and its runtime is logged';
+    subtest 'expected commands sent' => sub {
+        my %pause_on_failure = (cmd => 'pause_test_execution', due_to_failure => 1);
+        like delete $cmds->[0]->{reason}, qr/test died: Died at .*17-basetest\.t/, 'reason for pause passed';
+        is_deeply $cmds->[0], \%pause_on_failure, 'failure reported to pause if pausing on failures enabled';
+        my %test_name_update = (cmd => 'set_current_test', name => 'foo', full_name => 'foo (post fail hook)');
+        is_deeply $cmds->[1], \%test_name_update, 'test name updated (to show post fail hook in developer mode)';
+    } or diag explain $cmds;
 
     $bmwqemu::vars{_SKIP_POST_FAIL_HOOKS} = 1;
     combined_like { dies_ok { $basetest->runtest } 'behavior persists regardless of _SKIP_POST_FAIL_HOOKS setting' }
     qr/Test died/, 'test died';
+
+    $bmwqemu::vars{_SKIP_POST_FAIL_HOOKS} = 0;
+    $cmds = [];
+    $fake_ignore_failure = 1;
+    $logs = combined_from { $basetest->runtest };
+    like $logs, qr/Test died.*ignoring.*failure via developer mode/s, 'test died but failure ignored';
+    unlike $logs, qr/post fail hook/, 'post fail hook not invoked when ignoring failure';
 };
 
 subtest modules_test => sub {
@@ -79,6 +124,8 @@ subtest modules_test => sub {
     ok($basetest->is_applicable, 'module is applicable by default');
     $bmwqemu::vars{EXCLUDE_MODULES} = 'foo,bar';
     ok(!$basetest->is_applicable, 'module can be excluded');
+    $bmwqemu::vars{EXCLUDE_MODULES} = 'installation-foo';
+    ok(!$basetest->is_applicable, 'model can be excluded by fullname');
     $bmwqemu::vars{EXCLUDE_MODULES} = '';
     $bmwqemu::vars{INCLUDE_MODULES} = 'bar,baz';
     ok(!$basetest->is_applicable, 'modules can be excluded based on a passlist');
@@ -115,6 +162,26 @@ subtest parse_serial_output => sub {
     $basetest->parse_serial_output_qemu();
     is($basetest->{result}, 'ok', 'test result set to ok');
     is($message, 'CPU soft lockup detected - Serial error: Serial to match', 'log message matches output');
+
+    $basetest->{result} = 'softfail';
+    $basetest->{serial_failures} = [
+        {type => 'info', message => 'CPU soft lockup detected', pattern => qr/Serial/},
+    ];
+    $basetest->parse_serial_output_qemu();
+    is($basetest->{result}, 'softfail', 'test result stays at softfail on ok match');
+
+    $basetest->{result} = 'fail';
+    $basetest->{serial_failures} = [
+        {type => 'info', message => 'CPU soft lockup detected', pattern => qr/Serial/},
+    ];
+    $basetest->parse_serial_output_qemu();
+    is($basetest->{result}, 'fail', 'test result stays at fail on ok match');
+    $basetest->{serial_failures} = [
+        {type => 'soft', message => 'CPU soft lockup detected', pattern => qr/Serial/},
+    ];
+    $basetest->parse_serial_output_qemu();
+    is($basetest->{result}, 'fail', 'test result stays at fail on softfail match');
+    $basetest->{result} = undef;
 
     $basetest->{serial_failures} = [
         {type => 'soft', message => 'SimplePattern', pattern => qr/Serial/},
@@ -174,13 +241,11 @@ subtest get_new_serial_output => sub {
 
 subtest record_testresult => sub {
     my $basetest_class = 'basetest';
-    my $mock_basetest = Test::MockModule->new($basetest_class);
-    $mock_basetest->redefine(_result_add_screenshot => sub { });
-
     my $basetest = bless({
             result => undef,
             details => [],
             test_count => 0,
+            name => 'test',
     }, $basetest_class);
 
     is_deeply($basetest->record_testresult(), {result => 'unk'}, 'adding unknown result');
@@ -214,10 +279,35 @@ subtest record_testresult => sub {
     is_deeply($basetest->take_screenshot(), {result => 'unk'},
         'unknown result from take_screenshot not added to details');
 
-    my $nr_test_details = 9;
-    is($basetest->{test_count}, $nr_test_details, 'test_count accumulated');
-    is(scalar @{$basetest->{details}}, $nr_test_details, 'all details added');
+    $last_screenshot_data = encode_base64(tinycv::new(1, 1)->ppm_data);
+
+    my $res = $basetest->take_screenshot();
+    is(ref delete $res->{frametime}, 'ARRAY', 'frametime returned');
+
+    is_deeply($res, {result => 'unk', screenshot => 'test-11.png'},
+        'mock image added to details');
+
+    is($basetest->{test_count}, 11, 'test_count accumulated');
+    is(scalar @{$basetest->{details}}, 10, 'all details added');
 };
+
+subtest 'number of test results is limited' => sub {
+    my $total_result_count = basetest::total_result_count;
+    ok $total_result_count, 'counter for total results has been incremented before';
+    my $basetest = basetest::new('basetest');
+    $bmwqemu::vars{MAX_TEST_STEPS} = $total_result_count + 1;
+    is_deeply $basetest->record_testresult('ok'), {result => 'ok'}, 'can add one more test result';
+    throws_ok { $basetest->record_testresult('ok') } qr/allowed test steps.*exceeded/, 'unable to add a second test result';
+    my $state_file = decode_json(path(bmwqemu::STATE_FILE)->slurp);
+    is delete $state_file->{result}, 'incomplete', 'job result serialized';
+    like delete $state_file->{msg}, qr/allowed test.*exceeded/, 'message for reason serialized';
+    is delete $state_file->{component}, 'tests', 'component for reason serialized';
+    ok $basetest->{fatal_failure}, 'failure considered fatal';
+    $basetest->remove_last_result;
+    is_deeply $basetest->record_testresult('ok'), {result => 'ok'}, 'can add one test result again';
+};
+
+delete $bmwqemu::vars{MAX_TEST_STEPS};
 
 subtest record_screenmatch => sub {
     my $basetest = basetest->new();
@@ -230,6 +320,7 @@ subtest record_screenmatch => sub {
         needle => {
             name => 'foo',
             file => 'some/path/foo.json',
+            unregistered => 'yes',
         },
     );
     my @tags = (qw(some tags));
@@ -390,6 +481,69 @@ subtest 'execute_time' => sub {
     $mock_basetest->redefine(done => undef);
     combined_like { $test->runtest } qr/finished basetest foo/, 'finish status message found';
     is($test->{execution_time}, 42, 'the execution time is correct');
+};
+
+subtest skip_if_not_running => sub {
+    my $test = basetest->new();
+    $test->{result} = undef;
+    $test->skip_if_not_running;
+    is($test->{result}, 'skip', 'skip_if_not_running works as expected');
+};
+
+subtest capture_filename => sub {
+    my $test = basetest->new();
+    $test->capture_filename;
+    is($test->{wav_fn}, 'basetest-captured.wav', 'capture_filename works as expected');
+};
+
+subtest stop_audiocapture => sub {
+    my $test = basetest->new();
+    my $res = $test->stop_audiocapture();
+    is($res->{audio}, undef, 'audio capture stopped');
+    is($res->{result}, 'unk', 'audio capture stopped');
+    is($test->{details}->[-1], $res, 'result appended to details');
+};
+
+$mock_bmwqemu->noop('fctres', 'fctinfo');
+
+subtest verify_sound_image => sub {
+    my $test = basetest->new();
+    my $res = $test->verify_sound_image("$FindBin::Bin/data/frame1.ppm", 'notapath2', 'check');
+    is_deeply($res->{area}, [{x => 1, y => 2, similarity => 100}], 'area was returned') or diag explain $res->{area};
+    is($res->{needle}->{file}, 'foundneedle.json', 'needle file was returned');
+    is($res->{needle}->{name}, 'foundneedle', 'needle name was returned');
+    $suppress_match = 'yes';
+    my $details;
+    my $mock_test = Test::MockModule->new('basetest');
+    $mock_test->mock(record_screenfail => sub { my ($self, %args) = @_; $details = \%args; });
+    $res = $test->verify_sound_image("$FindBin::Bin/data/frame1.ppm", "$FindBin::Bin/data/frame2.ppm", 1);
+    is($res, undef, 'res is undef as expected') or diag explain $res;
+    is($details->{result}, 'unk', 'no needle match: unknown status correct') or diag explain $details;
+    $res = $test->verify_sound_image("$FindBin::Bin/data/frame1.ppm", "$FindBin::Bin/data/frame2.ppm", 0);
+    is($details->{result}, 'fail', 'no needle match: status fail') or diag explain $details;
+    is($details->{overall}, 'fail', 'no needle match: overall fail') or diag explain $details;
+};
+
+subtest rollback_activated_consoles => sub {
+    my $test = basetest->new();
+    $test->{activated_consoles} = ['activated_console'];
+    $autotest::last_milestone_console = 'last_milestone_console';
+    $test->rollback_activated_consoles;
+    is_deeply($test->{activated_consoles}, [], 'activated consoles cleared') or diag explain $test->{activated_consoles};
+    is_deeply(\@reset_consoles, [{cmd => 'backend_reset_console', testapi_console => 'activated_console'}], 'activated consoles reset') or diag explain \@reset_consoles;
+    is_deeply(\@selected_consoles, [{cmd => 'backend_select_console', testapi_console => 'last_milestone_console'}], 'last milestone console selected') or diag explain \@selected_consoles;
+};
+
+$mock_bmwqemu->noop('diag', 'modstate');
+
+subtest search_for_expected_serial_failures => sub {
+    $bmwqemu::vars{BACKEND} = 'qemu';
+    my $basetest = basetest->new();
+    my $mock_basetest = Test::MockModule->new('basetest');
+    $mock_basetest->mock(run => sub { die 'test failure' });
+    $mock_basetest->mock(parse_serial_output_qemu => sub { $basetest->{result} = 'successfully called function' });
+    $basetest->runtest();
+    is($basetest->{result}, 'successfully called function', 'search for expected serial failures is working');
 };
 
 done_testing;

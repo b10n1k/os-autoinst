@@ -5,6 +5,7 @@
 
 use Test::Most;
 use Mojo::Base -strict, -signatures;
+use Test::Mock::Time;
 use FindBin '$Bin';
 use lib "$Bin/../external/os-autoinst-common/lib";
 use OpenQA::Test::TimeLimit '5';
@@ -28,7 +29,7 @@ sub create_vars ($data) {
     close($varsfh);
 }
 
-sub read_vars {
+sub read_vars () {
     local $/;
     open(my $varsfh, '<', 'vars.json') || BAIL_OUT('can not open vars.json for reading');
     my $ret;
@@ -62,9 +63,27 @@ subtest 'log_call' => sub {
     stderr_like(\&log_call_indent, qr{\Q<<< main::log_call_indent(test=[\E\n\Q    "a",\E\n\Q    [\E\n\Q      "b"\E\n\Q    ]\E\n\Q  ])}, 'log_call auto indentation');
 
     sub log_call_test_secret {
-        bmwqemu::log_call(text => "passwd\n", secret => 1);
+        my (%args) = @_;
+        # Use @_ instead of %args to keep the order
+        bmwqemu::log_call(@_, ($args{secret} ? (-masked => $args{text}) : ()));
+        return;
     }
-    stderr_like(\&log_call_test_secret, qr{\Q<<< main::log_call_test_secret(text="[masked]", secret=1)}, 'log_call hides sensitive info');
+    stderr_like { log_call_test_secret(text => "password\n", secret => 1) } qr{\Q<<< main::log_call_test_secret(text="[masked]", secret=1)}, 'log_call hides sensitive info';
+    stderr_like { log_call_test_secret(text => "password\n") } qr{\Q<<< main::log_call_test_secret(text="password\n")}, 'log_call hides sensitive info';
+
+    my $do_not_show_me = '$^a{1}\n\\FooBar.';
+    stderr_like { log_call_test_secret(text => $do_not_show_me, psk => $do_not_show_me, -masked => $do_not_show_me) } qr{\Q<<< main::log_call_test_secret(text="[masked]", psk="[masked]")}, 'Hide secrets with special regex chars';
+    stderr_like { log_call_test_secret(text => "$do_not_show_me$do_not_show_me", -masked => $do_not_show_me) } qr{\Q<<< main::log_call_test_secret(text="[masked][masked]")}, 'Hide secrets if it occure multiple times';
+
+    stderr_like { log_call_test_secret(text => "a666b42c", -masked => ['666', '42']) } qr{\Q<<< main::log_call_test_secret(text="a[masked]b[masked]c")}, 'Hide multiple secrets given as array';
+    stderr_like { log_call_test_secret(text => "a666b42c", -masked => '666', -masked => '42') } qr{\Q<<< main::log_call_test_secret(text="a[masked]b[masked]c")}, 'Hide multiple secrets given as multiple arguments';
+    stderr_like { log_call_test_secret(text => "a666b42c5", -masked => ['666', '5'], -masked => '42') } qr{\Q<<< main::log_call_test_secret(text="a[masked]b[masked]c[masked]")}, 'Hide multiple secrets given in mixed format';
+
+    my $super_long_partly_secret_string = "Hallo world my psk is $do_not_show_me";
+    stderr_like { log_call_test_secret(output => $super_long_partly_secret_string, -masked => $do_not_show_me) } qr{\Q<<< main::log_call_test_secret(output="Hallo world my psk is [masked]")}, 'Hide secrets as part of a string';
+
+    stderr_like { log_call_test_secret(value => 0) } qr{\Q<<< main::log_call_test_secret(value=0)}, 'Value evaluate to false';
+    stderr_like { log_call_test_secret(value => undef) } qr{\Q<<< main::log_call_test_secret(value=undef)}, 'Undef as value';
 };
 
 subtest 'update_line_number' => sub {
@@ -137,15 +156,22 @@ subtest 'HDD variables sanity check' => sub {
 
 subtest 'invalid vars characters' => sub {
     my $num = scalar %bmwqemu::vars;
-    like warning { $bmwqemu::vars{lowercase_not_accepted} = 23 }, qr{Settings key 'lowercase_not_accepted' is invalid.*12-bmwqemu.t}s, 'Warning is issued for invalid setting keys';
+    throws_ok { $bmwqemu::vars{lowercase_not_accepted} = 23 } qr{Settings key 'lowercase_not_accepted' is invalid.*12-bmwqemu.t}s, 'Invalid keys results in an exception';
+    $bmwqemu::vars{LOWERCASE_NOT_ACCEPTED} = 23;
     my $new_num = %bmwqemu::vars;
     is $new_num, $num + 1, '%vars in scalar context works';
-    is exists $bmwqemu::vars{lowercase_not_accepted}, 1, 'exists $vars{...} works';
+    is exists $bmwqemu::vars{lowercase_not_accepted}, '', 'exists $vars{...} works, lowercase key not found';
+    is exists $bmwqemu::vars{LOWERCASE_NOT_ACCEPTED}, 1, 'exists $vars{...} works';
 };
 
-my %new_json = (foo => 'bar', baz => 42);
+my %new_json = (foo => 'bar', baz => 42, object => bless {this => "cannot be encoded"}, 'Foo');
+throws_ok { bmwqemu::save_json_file(\%new_json, 'new_json_file.json') } qr{Cannot encode input.*encountered object.*bless.*cannot be encoded}s;
+delete $new_json{object};
 ok bmwqemu::save_json_file(\%new_json, 'new_json_file.json'), 'JSON file can be saved with save_json_file';
 is_deeply decode_json(path('new_json_file.json')->slurp), \%new_json, 'JSON file written with correct content';
+
+ok bmwqemu::wait_for_one_more_screenshot, 'wait for one more screenshot is ok';
+
 done_testing;
 
 END {

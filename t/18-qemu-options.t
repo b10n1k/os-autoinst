@@ -42,9 +42,9 @@ my @common_options = (
 my $vars_json = path('vars.json');
 my $log_file = path('autoinst-log.txt');
 my $log = '';
-sub run_isotovideo {
-    $vars_json->spurt(encode_json({@common_options, @_}));
-    ok system("perl $toplevel_dir/isotovideo -d qemu_disable_snapshots=1 2>&1 | tee autoinst-log.txt") == 0, 'zero exit status';
+sub run_isotovideo (@args) {
+    $vars_json->spew(encode_json({@common_options, @args}));
+    ok system("cd $toplevel_dir && perl $toplevel_dir/isotovideo --workdir $pool_dir -d qemu_disable_snapshots=1 2>&1 | tee $pool_dir/autoinst-log.txt") == 0, 'zero exit status';
     $log = $log_file->slurp;
 }
 
@@ -71,7 +71,7 @@ subtest qemu_append_option => sub {
     # multiple options added, only version will be effective
     # test whether QMP connection attempts are aborted when QEMU exists: unset QEMU_QMP_CONNECT_ATTEMPTS temporarily
     my $qmp_connect_attempts = delete $ENV{QEMU_QMP_CONNECT_ATTEMPTS};
-    run_isotovideo(@common_options, QEMU_APPEND => 'M ? -version');
+    run_isotovideo(@common_options, QEMU_APPEND => 'version -M ?');
     like($log, qr/-M \?/, '-M ? option added');
     like($log, qr/-version/, '-version option added');
     like($log, qr/QEMU emulator version/, 'QEMU version printed');

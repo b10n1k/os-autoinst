@@ -11,24 +11,26 @@ options:
     --coverage         record test coverage
     --prove-tool       prove tool to use (defaults to prove)
     --make-tool        make tool to use (defaults to make)
+    --unbuffer-tool    unbuffer tool to use (defaults to unbuffer)
     --build-directory  build directory (defaults to $source_directory)"
     exit
 }
 
 # parse arguments
-prove_path=prove make_path=make build_directory=$source_directory
+prove_path=prove make_path=make unbuffer_path=unbuffer build_directory=$source_directory
 opts=$(getopt \
     --options h \
-    --longoptions help,coverage,skip-if-cover-db-exists,prove-tool:,make-tool:,build-directory: \
+    --longoptions help,coverage,skip-if-cover-db-exists,prove-tool:,make-tool:,unbuffer-tool:,build-directory: \
     --name "$(basename "$0")" -- "$@") || usage
 eval set -- "$opts"
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -h | --help               ) usage;                     shift   ;;
+    -h | --help               ) usage                              ;;
     --coverage                ) WITH_COVER_OPTIONS=1;      shift   ;;
     --skip-if-cover-db-exists ) SKIP_IF_COVER_DB_EXISTS=1; shift   ;;
     --prove-tool              ) prove_path=$2;             shift 2 ;;
     --make-tool               ) make_path=$2;              shift 2 ;;
+    --unbuffer-tool           ) unbuffer_path=$2;          shift 2 ;;
     --build-directory         ) build_directory=$2;        shift 2 ;;
     --                        ) shift; break ;;
     *                         ) break ;;
@@ -40,25 +42,21 @@ db="$build_directory/cover_db"
 [[ $SKIP_IF_COVER_DB_EXISTS ]] && [[ -d $db ]] && exit 0
 
 # set Perl module include path and coverage options
-export PERL5LIB="$source_directory:$source_directory/ppmclibs:$source_directory/ppmclibs/blib/arch/auto/tinycv:$PERL5LIB"
+export PERL5LIB="$source_directory:$source_directory/ppmclibs/blib/lib:$source_directory/ppmclibs/blib/arch/auto/tinycv:$PERL5LIB"
 if [[ $WITH_COVER_OPTIONS ]]; then
-    path_regex="^|$source_directory/|\\.\\./"
-    select="($path_regex)(OpenQA|backend|consoles|ppmclibs)/|($path_regex)isotovideo|($path_regex)[^/]+\.pm,-ignore,\.t|data/tests/|fake/tests/|/CheckGitStatus.pm|$prove_path"
-    export PERL5OPT="-I$source_directory/t/lib -MOpenQA::Test::CheckGitStatus -MDevel::Cover=-db,$db,-select,$select,-coverage,statement"
+    ignore="external/|tools/|t/data/tests/tests/|t/data/wheels_dir|/tmp|/CheckGitStatus.pm|$prove_path"
+    # add ' -MOpenQA::Test::PatchDeparse' for older OS versions to avoid warnings
+    export PERL5OPT="-I$source_directory/t/lib -I$source_directory/external/os-autoinst-common/lib -MOpenQA::Test::CheckGitStatus -MDevel::Cover=-db,$db,-ignore,$ignore,-coverage,statement"
 fi
-
 # set variables for tests which need to invoke the make tool
 export OS_AUTOINST_BUILD_DIRECTORY=$build_directory
 export OS_AUTOINST_MAKE_TOOL=$make_path
 
-# invoke tests within the t and xt directory
-if [[ $TESTS = *[!\ ]* ]]; then
-    # split TESTS on white-spaces to allow specifying multiple tests as documented
-    # shellcheck disable=SC2086
-    "$prove_path" $PROVE_ARGS $TESTS
-else
-    # shellcheck disable=SC2086
-    cd t && "$prove_path" $PROVE_ARGS -r
-    # shellcheck disable=SC2086
-    cd ../xt && "$prove_path" $PROVE_ARGS -r
-fi
+args=()
+# use unbuffer if it was found so e.g. timestamps on OBS builds will be useful
+# note: When executing tests with prove it seems that the output is only flushed after one test has finished unless there's a terminal.
+[[ $unbuffer_path ]] && [[ $unbuffer_path != 'UNBUFFER_PATH-NOTFOUND' ]] && args+=("$unbuffer_path")
+# split TESTS on white-spaces to allow specifying multiple tests as documented
+# shellcheck disable=SC2206
+args+=("$prove_path" $PROVE_ARGS ${TESTS:-"-r"})
+(cd "$source_directory" && "${args[@]}")

@@ -6,12 +6,13 @@ package testapi;
 
 use Carp;
 use Exporter;
-use Mojo::Base 'Exporter';
+use Mojo::Base 'Exporter', -signatures;
 use File::Basename qw(basename dirname);
 use File::Path 'make_path';
 use Time::HiRes qw(sleep gettimeofday tv_interval);
 use autotest 'query_isotovideo';
 use Mojo::DOM;
+use Net::Domain qw(hostfqdn);
 require IPC::System::Simple;
 use autodie ':all';
 use OpenQA::Exceptions;
@@ -52,7 +53,7 @@ our @EXPORT = qw($realname $username $password $serialdev %cmd %vars
   become_root x11_start_program ensure_installed eject_cd power
 
   switch_network
-  save_memory_dump save_storage_drives freeze_vm resume_vm
+  save_memory_dump freeze_vm resume_vm save_storage
 
   diag hashed_string
 
@@ -68,16 +69,15 @@ our $realname = "Bernhard M. Wiedemann";
 our $username;
 our $password;
 
+our $last_matched_needle;
 our $serialdev;
 
-our $last_matched_needle;
-
-sub send_key;
 sub check_screen;
-sub type_string;
-sub type_password;
 sub enter_cmd;
-
+sub is_serial_terminal;
+sub send_key;
+sub type_password;
+sub type_string;
 
 =head1 introduction
 
@@ -107,12 +107,9 @@ to be used in tests.
 
 =cut
 
-sub _calculate_clickpoint {
-    my ($needle_to_use, $needle_area, $click_point) = @_;
+sub _calculate_clickpoint ($needle_to_use, $needle_area = undef, $click_point = undef) {
     # If there is no needle area defined, take it from the needle itself.
-    if (!$needle_area) {
-        $needle_area = $needle_to_use->{area}->[-1];
-    }
+    $needle_area ||= $needle_to_use->{area}->[-1];
     # If there is no clickpoint defined, or if it has been specifically defined as "center"
     # then calculate the click point as a central point of the specified area.
     if (!$click_point || $click_point eq 'center') {
@@ -136,16 +133,14 @@ Used for internal initialization, do not call from tests.
 
 =cut
 
-sub init {
-    if (get_var('OFW') || get_var('BACKEND', '') =~ /s390x|pvm_hmc/) {
-        $serialdev = "hvc0";
-    }
-    elsif (get_var('SERIALDEV')) {
-        $serialdev = get_var('SERIALDEV');
-    }
-    else {
-        $serialdev = 'ttyS0';
-    }
+sub _serialdev () {
+    return 'hvc0' if get_var('OFW') || get_var('BACKEND', '') =~ /s390x|pvm_hmc/;
+    return 'ttysclp0' if (check_var('ARCH', 's390x') && check_var('BACKEND', 'qemu'));
+    return get_var('SERIALDEV', 'ttyS0');
+}
+
+sub init () {
+    $serialdev = _serialdev();
     return;
 }
 
@@ -161,7 +156,7 @@ You can use distribution object to implement distribution specific helpers.
 
 =cut
 
-sub set_distribution {
+sub set_distribution {    # no:style:signatures
     ($distri) = @_;
     return $distri->init();
 }
@@ -178,9 +173,7 @@ Saves screenshot of current SUT screen.
 
 =cut
 
-sub save_screenshot {
-    return $autotest::current_test->take_screenshot;
-}
+sub save_screenshot () { $autotest::current_test->take_screenshot unless is_serial_terminal }
 
 =head2 record_soft_failure
 
@@ -197,23 +190,19 @@ influenced.
 
 =cut
 
-sub record_soft_failure {
-    my ($reason) = @_;
+sub record_soft_failure ($reason) {
     bmwqemu::log_call(reason => $reason);
 
     $autotest::current_test->record_soft_failure_result($reason);
 }
 
-sub _is_valid_result {
-    my ($result) = @_;
-    return $result =~ /^(ok|fail|softfail)$/;
-}
+sub _is_valid_result ($result) { $result =~ /^(ok|fail|softfail)$/ }
 
 =head2 record_info
 
 =for stopwords softfail
 
-    record_info($title, $output [, result => $result] [, resultname => $resultname]);
+    record_info($title [, $output] [, result => $result] [, resultname => $resultname]);
 
 Example:
 
@@ -229,8 +218,7 @@ tag on the result file.
 
 =cut
 
-sub record_info {
-    my ($title, $output, %nargs) = @_;
+sub record_info ($title, $output = undef, %nargs) {
     $nargs{result} //= 'ok';
     die 'unsupported $result \'' . $nargs{result} . '\'' unless _is_valid_result($nargs{result});
     $output //= '';
@@ -251,15 +239,13 @@ needing to handle failed tests a lot.
 
 =cut
 
-sub force_soft_failure {
-    my ($reason) = @_;
+sub force_soft_failure ($reason) {
     bmwqemu::log_call(reason => $reason);
 
     $autotest::current_test->record_soft_failure_result($reason, force_status => 1);
 }
 
-sub _handle_found_needle {
-    my ($foundneedle, $rsp, $tags) = @_;
+sub _handle_found_needle ($foundneedle, $rsp, $tags) {
     # convert the needle back to an object
     $foundneedle->{needle} = needle->new($foundneedle->{needle});
     my $img = tinycv::from_ppm(decode_base64($rsp->{image}));
@@ -273,11 +259,8 @@ sub _handle_found_needle {
 }
 
 
-sub _check_backend_response {
-    my ($rsp, $check, $timeout, $mustmatch) = @_;
-
+sub _check_backend_response ($rsp, $check, $timeout, $mustmatch) {
     my $tags = $rsp->{tags};
-
     if (my $foundneedle = $rsp->{found}) {
         return _handle_found_needle($foundneedle, $rsp, $tags);
     }
@@ -317,33 +300,20 @@ sub _check_backend_response {
                 check => $check,
         }) and return 'try_again';
 
-        if ($check) {
-            # only care for the last one
-            $failed_screens = [$final_mismatch];
-        }
+        # only care for the last one
+        $failed_screens = [$final_mismatch] if $check;
         for my $l (@$failed_screens) {
             my $img = tinycv::from_ppm(decode_base64($l->{image}));
             my $result = $check ? 'unk' : 'fail';
             $result = 'unk' if ($l != $final_mismatch);
-            if ($rsp->{saveresult}) {
-                $autotest::current_test->record_screenfail(
-                    img => $img,
-                    needles => $l->{candidates},
-                    tags => $tags,
-                    result => $result,
-                    frame => $l->{frame},
-                );
-            }
-            else {
-                $autotest::current_test->record_screenfail(
-                    img => $img,
-                    needles => $l->{candidates},
-                    tags => $tags,
-                    result => $result,
-                    overall => $check ? undef : 'fail',
-                    frame => $l->{frame},
-                );
-            }
+            $autotest::current_test->record_screenfail(
+                img => $img,
+                needles => $l->{candidates},
+                tags => $tags,
+                result => $result,
+                overall => (!$rsp->{saveresult} && $check) ? undef : 'fail',
+                frame => $l->{frame},
+            );
         }
         # Handle case where a stall was detected: fail if this is an
         # assert_screen, warn if it's a check_screen
@@ -357,10 +327,7 @@ sub _check_backend_response {
         }
         if (!$check && !$rsp->{saveresult}) {
             # Must match can be only scalar or array ref.
-            my $needletags = $mustmatch;
-            if (ref($mustmatch) eq 'ARRAY') {
-                $needletags = join(', ', @$mustmatch);
-            }
+            my $needletags = ref($mustmatch) eq 'ARRAY' ? join(', ', @$mustmatch) : $mustmatch;
             OpenQA::Exception::FailedNeedle->throw(
                 error => "no candidate needle with tag(s) '$needletags' matched",
                 tags => $mustmatch
@@ -382,9 +349,7 @@ sub _check_backend_response {
     return;
 }
 
-sub _check_or_assert {
-    my ($mustmatch, $check, %args) = @_;
-
+sub _check_or_assert ($mustmatch, $check, %args) {
     die "no tags specified" if (!$mustmatch || (ref $mustmatch eq 'ARRAY' && scalar @$mustmatch == 0));
     die "current_test undefined" unless $autotest::current_test;
 
@@ -430,7 +395,7 @@ is hit. Default timeout is 30s.
 
 =cut
 
-sub assert_screen {
+sub assert_screen {    # no:style:signatures
     my ($mustmatch) = shift;
     my $timeout;
     $timeout = shift if (@_ % 2);
@@ -458,7 +423,7 @@ Returns matched needle or C<undef> if timeout is hit. Default timeout is 0s.
 
 =cut
 
-sub check_screen {
+sub check_screen {    # no:style:signatures
     my ($mustmatch) = shift;
     my $timeout;
     $timeout = shift if (@_ % 2);
@@ -477,17 +442,11 @@ been matched at the time of the call.
 
 =cut
 
-sub match_has_tag {
-    my ($tag) = @_;
-    if ($last_matched_needle) {
-        return $last_matched_needle->{needle}->has_tag($tag);
-    }
-    return;
-}
+sub match_has_tag ($tag) { $last_matched_needle ? $last_matched_needle->{needle}->has_tag($tag) : undef }
 
 =head2 assert_and_click
 
-  assert_and_click($mustmatch [, timeout => $timeout] [, button => $button] [, clicktime => $clicktime ] [, dclick => 1 ] [, mousehide => 1 ]);
+  assert_and_click($mustmatch [, timeout => $timeout] [, button => $button] [, clicktime => $clicktime ] [, dclick => 1 ] [, mousehide => 1 ] [, point_id => $id ]);
 
 Wait for needle with C<$mustmatch> tag to appear on SUT screen. Then click
 C<$button> at the "click_point" position as defined in the needle JSON file,
@@ -496,43 +455,45 @@ needle area. If C<$dclick> is set, do double click instead.  C<$mustmatch> can
 be string or C<ARRAYREF> of strings (C<['tag1', 'tag2']>).  C<$button> is by
 default C<'left'>. C<'left'> and C<'right'> is supported. If C<$mousehide> is
 true then always move mouse to the 'hidden' position after clicking to prevent
-to hide the area where user wants to assert/click in second step.
+to hide the area where the user wants to assert/click in the second step. If
+C<$point_id> is specified, the clickpoint used will be the one with a matching
+ID.
 
 Throws C<FailedNeedle> exception if C<$timeout> timeout is hit. Default timeout is 30s.
 
 =cut
 
-sub assert_and_click {
-    my ($mustmatch, %args) = @_;
+sub assert_and_click ($mustmatch, %args) {
     $args{timeout} //= $bmwqemu::default_timeout;
 
     $last_matched_needle = assert_screen($mustmatch, $args{timeout});
     bmwqemu::log_call(mustmatch => $mustmatch, %args);
 
-    my %click_args = map { $_ => $args{$_} } qw(button dclick mousehide);
+    my %click_args = map { $_ => $args{$_} } qw(button clicktime dclick mousehide point_id);
     return click_lastmatch(%click_args);
 }
 
 =head2 click_lastmatch
 
-  click_lastmatch([, button => $button] [, clicktime => $clicktime ] [, dclick => 1 ] [, mousehide => 1 ]);
+  click_lastmatch([, button => $button] [, clicktime => $clicktime ] [, dclick => 1 ] [, mousehide => 1 ] [, point_id => $id ]);
 
 Click C<$button> at the "click_point" position as defined in the needle JSON file
 of the last matched needle, or - if the JSON has not explicit "click_point" -
 in the middle of the last match area. If C<$dclick> is set, do double click
 instead. Supported values for C<$button> are C<'left'> and C<'right'>, C<'left'>
 is the default. If C<$mousehide> is true then always move mouse to the 'hidden'
-position after clicking to prevent to disturb the area where user wants to
-assert/click in second step, otherwise move the mouse back to its previous
-position.
+position after clicking to prevent to disturb the area where the user wants to
+assert/click in the second step, otherwise move the mouse back to its previous
+position. If C<$point_id> is specified, the clickpoint used will be the one
+with a matching ID.
 
 =cut
 
-sub click_lastmatch {
-    my %args = @_;
+sub click_lastmatch (%args) {
     $args{button} //= 'left';
     $args{dclick} //= 0;
     $args{mousehide} //= 0;
+    $args{point_id} //= undef;
 
     return unless $last_matched_needle;
 
@@ -543,6 +504,7 @@ sub click_lastmatch {
     my $relative_click_point;
     for my $area (reverse @{$last_matched_needle->{area}}) {
         next unless ($relative_click_point = $area->{click_point});
+        next if defined $args{point_id} && $relative_click_point->{id} ne $args{point_id};
         $relevant_area = $area;
         last;
     }
@@ -578,15 +540,14 @@ Alias for C<assert_and_click> with C<$dclick> set.
 
 =cut
 
-sub assert_and_dclick {
-    my ($mustmatch, %args) = @_;
+sub assert_and_dclick ($mustmatch, %args) {
     $args{dclick} = 1;
     return assert_and_click($mustmatch, %args);
 }
 
 =head2 wait_screen_change
 
-  wait_screen_change(CODEREF [,$timeout [, similarity_level => 50]]);
+  wait_screen_change(CODEREF [,$timeout [, similarity_level => 50, no_wait => 0]]);
 
 Wrapper around code that is supposed to change the screen. This is the
 opposite to C<wait_still_screen>. Make sure to put the commands to change the
@@ -611,37 +572,37 @@ subroutine block.
     send_key 'esc';
   }, 15);
 
+To lower the backend's internal update interval while looking for screen changes, use
+the optional parameter `no_wait => 1`. This makes the test execution faster if the
+screen change is expected to happen (almost) immediately.
+
 Returns true if screen changed or false on timeout. Default timeout is 10s. Default
 similarity_level is 50.
 
 =cut
 
-sub wait_screen_change(&@) {
+sub wait_screen_change : prototype(&@) {    # no:style:signatures
     my ($callback, $timeout, %args) = @_;
     $timeout ||= 10;
     $args{similarity_level} //= 50;
 
     bmwqemu::log_call(timeout => $timeout, %args);
-    $timeout = bmwqemu::scale_timeout($timeout);
+    $args{timeout} = bmwqemu::scale_timeout($timeout);
 
     # get the initial screen
     query_isotovideo('backend_set_reference_screenshot');
     $callback->() if $callback;
 
-    my $starttime = time;
-
-    while (time - $starttime < $timeout) {
-        my $sim = query_isotovideo('backend_similiarity_to_reference')->{sim};
-        bmwqemu::diag("waiting for screen change: " . (time - $starttime) . " $sim");
-        if ($sim < $args{similarity_level}) {
-            bmwqemu::fctres("screen change seen at " . (time - $starttime));
-            return 1;
-        }
-        sleep(0.5);
+    my $res = query_isotovideo('backend_wait_screen_change', \%args);
+    if (!$res->{timed_out}) {
+        bmwqemu::fctres("screen change seen after $res->{elapsed} seconds (similarity: $res->{sim})");
+        return 1;
     }
-    save_screenshot;
-    bmwqemu::fctres("timed out");
-    return 0;
+    else {
+        bmwqemu::fctres("timed out after $res->{elapsed} seconds (similarity: $res->{sim})");
+        save_screenshot;
+        return 0;
+    }
 }
 
 =head2 assert_screen_change
@@ -657,7 +618,8 @@ Example:
 
 =cut
 
-sub assert_screen_change(&@) {
+sub assert_screen_change : prototype(&@) {    # no:style:signatures
+
     # Need to parse code reference and pass to the method explicitly as
     # wait_screen_change uses prototype which expects code block as an argument
     # This resolves compile time issues
@@ -681,45 +643,29 @@ Default timeout is 30s, default stilltime is 7s.
 
 =cut
 
-sub wait_still_screen {
+sub wait_still_screen {    # no:style:signatures
     my $stilltime = looks_like_number($_[0]) ? shift : 7;
     my $timeout = (@_ % 2) ? shift : $bmwqemu::default_timeout;
     my %args = (stilltime => $stilltime, timeout => $timeout, @_);
     $args{similarity_level} //= 47;
     bmwqemu::log_call(%args);
-    $timeout = bmwqemu::scale_timeout($args{timeout});
+    $timeout = $args{timeout} = bmwqemu::scale_timeout($args{timeout});
     $stilltime = $args{stilltime};
     if ($timeout < $stilltime) {
         bmwqemu::fctwarn("Selected timeout \'$timeout\' below stilltime \'$stilltime\', returning with false");
         return 0;
     }
 
-    my $starttime = time;
-    my $lastchangetime = [gettimeofday];
-    query_isotovideo('backend_set_reference_screenshot');
-
-    my $sim = 0;
-    while (time - $starttime < $timeout) {
-        $sim = query_isotovideo('backend_similiarity_to_reference')->{sim};
-        my $now = [gettimeofday];
-        if ($sim < $args{similarity_level}) {
-
-            # a change
-            $lastchangetime = $now;
-            query_isotovideo('backend_set_reference_screenshot');
-        }
-        if (($now->[0] - $lastchangetime->[0]) + ($now->[1] - $lastchangetime->[1]) / 1000000. >= $stilltime) {
-            bmwqemu::fctres("detected same image for $stilltime seconds, last detected similarity is $sim");
-            return 1;
-        }
-        # with 'no_wait' actually wait a little bit not to waste too much CPU
-        # corresponding to what check_screen/assert_screen also does
-        # internally
-        sleep($args{no_wait} ? 0.01 : 0.5);
+    my $res = query_isotovideo('backend_wait_still_screen', \%args);
+    if (!$res->{timed_out}) {
+        bmwqemu::fctres("detected same image for $stilltime seconds ($res->{elapsed} s elapsed), last detected similarity is $res->{sim}");
+        return 1;
     }
-    $autotest::current_test->timeout_screenshot();
-    bmwqemu::fctres("wait_still_screen timed out after $timeout, last detected similarity is $sim");
-    return 0;
+    else {
+        $autotest::current_test->timeout_screenshot;
+        bmwqemu::fctres("wait_still_screen timed out after $res->{elapsed} seconds, last detected similarity is $res->{sim}");
+        return 0;
+    }
 }
 
 =head2 assert_still_screen
@@ -731,8 +677,8 @@ into C<wait_still_screen> for details.
 
 =cut
 
-sub assert_still_screen(@) {
-    wait_still_screen(@_) or die 'assert_still_screen failed to detect a still screen';
+sub assert_still_screen (@args) {
+    wait_still_screen(@args) or die 'assert_still_screen failed to detect a still screen';
 }
 
 =head1 test variable access
@@ -745,8 +691,7 @@ Returns content of test variable C<$variable> or the C<$default> given as second
 
 =cut
 
-sub get_var {
-    my ($var, $default) = @_;
+sub get_var ($var, $default = undef) {
     return $bmwqemu::vars{$var} // $default;
 }
 
@@ -758,8 +703,7 @@ Similar to C<get_var> but without default value and throws exception if variable
 
 =cut
 
-sub get_required_var {
-    my ($var) = @_;
+sub get_required_var ($var) {
     return $bmwqemu::vars{$var} // croak "Could not retrieve required variable $var";
 }
 
@@ -779,8 +723,7 @@ to make sure that possibly deselected needles are now taken into account
 
 =cut
 
-sub set_var {
-    my ($var, $val, %args) = @_;
+sub set_var ($var, $val, %args) {
     $bmwqemu::vars{$var} = $val;
     if ($args{reload_needles}) {
         bmwqemu::save_vars();
@@ -798,10 +741,8 @@ Returns true if test variable C<$variable> is equal to C<$value> or returns C<un
 
 =cut
 
-sub check_var {
-    my ($var, $val) = @_;
-    return 1 if (defined $bmwqemu::vars{$var} && $bmwqemu::vars{$var} eq $val);
-    return 0;
+sub check_var ($var, $val) {
+    return defined $bmwqemu::vars{$var} && $bmwqemu::vars{$var} eq $val;
 }
 
 =head2 get_var_array
@@ -812,8 +753,7 @@ Return the given variable as array reference (split variable value by , | or ; )
 
 =cut
 
-sub get_var_array {
-    my ($var, $default) = @_;
+sub get_var_array ($var, $default = undef) {
     my @vars = split(/,|;/, $bmwqemu::vars{$var} || '');
     my @default = split(/,|;/, $default || '');
     return \@default if !@vars;
@@ -828,8 +768,7 @@ Boolean function to check if a value list contains a value
 
 =cut
 
-sub check_var_array {
-    my ($var, $val) = @_;
+sub check_var_array ($var, $val) {
     my $vars_r = get_var_array($var);
     return grep { $_ eq $val } @$vars_r;
 }
@@ -856,7 +795,7 @@ For more info see consoles/virtio_console.pm and consoles/serial_screen.pm.
 
 =cut
 
-sub is_serial_terminal {
+sub is_serial_terminal () {
     state $ret;
     state $last_seen = '';
     if (defined current_console() && current_console() ne $last_seen) {
@@ -892,7 +831,7 @@ C<$expect_not_found> is true. The default timeout is 90 seconds.
 
 =cut
 
-sub wait_serial {
+sub wait_serial {    # no:style:signatures
     my $regexp = shift;
     my %args = compat_args(
         {
@@ -909,11 +848,7 @@ sub wait_serial {
     $args{timeout} = bmwqemu::scale_timeout($args{timeout});
 
     my $ret = query_isotovideo('backend_wait_serial', \%args);
-    my $matched = $ret->{matched};
-
-    if ($args{expect_not_found}) {
-        $matched = !$matched;
-    }
+    my $matched = $args{expect_not_found} ? !$ret->{matched} : $ret->{matched};
     bmwqemu::wait_for_one_more_screenshot() unless is_serial_terminal;
 
     # to string, we need to feed string of result to
@@ -939,18 +874,18 @@ I<The implementation is distribution specific and not always available.>
 
 =cut
 
-sub x11_start_program {
+sub x11_start_program {    # no:style:signatures
     my ($program, @args) = @_;
     bmwqemu::log_call(program => $program, @args);
     return $distri->x11_start_program($program, @args);
 }
 
-sub _handle_script_run_ret {
+sub _handle_script_run_ret {    # no:style:signatures
     my ($ret, $cmd, %args) = @_;
-    croak "command '$cmd' timed out" unless (defined $ret);
+    return autotest::croak assert_script_run => "command '$cmd' timed out" unless defined $ret;
     my $die_msg = "command '$cmd' failed";
     $die_msg .= ": $args{fail_message}" if $args{fail_message};
-    croak $die_msg unless ($ret == 0);
+    return autotest::croak assert_script_run => $die_msg unless $ret == 0;
 }
 
 =head2 assert_script_run
@@ -974,7 +909,7 @@ should work on *nix operating systems with a configured serial device.>
 
 =cut
 
-sub assert_script_run {
+sub assert_script_run {    # no:style:signatures
     my $cmd = shift;
     my %args = compat_args(
         {
@@ -994,7 +929,7 @@ sub assert_script_run {
 
 =head2 script_run
 
-  script_run($cmd [, timeout => $timeout] [, output => ''] [, quiet => $quiet] [, die_on_timeout => -1]);
+  script_run($cmd [, timeout => $timeout] [, output => ''] [, quiet => $quiet] [, die_on_timeout => 1]);
 
 Deprecated mode
 
@@ -1007,9 +942,10 @@ execution to complete.
 C<$output> can be used as an explanatory text that will be displayed with the execution of
 the command.
 
-With C<die_on_timeout> -1 (default) a warning will be printed to log. To avoid
-this warning, set it explicit to 0. With C<die_on_timeout> equal to 1, this command
-throw an exception, if timeout expires.
+By default C<script_run> will throw an exception if the timeout has expired.
+This is equivalent to use of C<die_on_timeout> equal to 1. To use the
+deprecated behaviour of not throwing an error on timeout set the value to 0.
+This option will be removed in the near future.
 
 <Returns> exit code received from I<$cmd> or undef if C<$timeout> is 0 or timeout
 expired and C<die_on_timeout> is not C<1>.
@@ -1022,7 +958,7 @@ device C<$serialdev>.
 
 =cut
 
-sub script_run {
+sub script_run {    # no:style:signatures
     my $cmd = shift;
     my %args = compat_args(
         {
@@ -1033,23 +969,20 @@ sub script_run {
         }, ['timeout'], @_);
 
     bmwqemu::log_call(cmd => $cmd, %args);
-    my $die_on_timeout = delete $args{die_on_timeout};
+    my $die_on_timeout = delete $args{die_on_timeout} // 1;
     my $ret = $distri->script_run($cmd, %args);
     if ($args{timeout} > 0) {
-        if ($die_on_timeout > 0) {
-            croak("command '$cmd' timed out") if !defined($ret);
+        if ($die_on_timeout == 0) {
+            # This is to warn users of deprecated behaviour of script_run()
+            my ($package, $filename, $line) = caller;
+            my $casedir = testapi::get_var(CASEDIR => '');
+            $filename =~ s%^\Q$casedir\E/%%;
+            bmwqemu::fctwarn("DEPRECATED call of script_run() in $filename:$line " .
+                  'requested by `die_on_timeout => 0` or set
+                  $distri->{script_run_die_on_timeout}. Adapt the test code to work
+                  with the default. This workaround will be removed in the near future');
         } else {
-            # This is to warn users of script_run(), if they do not use
-            # die_on_timeout => 0 explicit.
-            if ($die_on_timeout < 0) {
-                my ($package, $filename, $line) = caller;
-                my $casedir = testapi::get_var(CASEDIR => '');
-                $filename =~ s%^\Q$casedir\E/%%;
-                bmwqemu::fctwarn("DEPRECATED call of script_run() in $filename:$line " .
-                      'add `die_on_timeout => ?` to the call or set
-                      $distri->{script_run_die_on_timeout} to avoid this
-                      warning');
-            }
+            croak("command '$cmd' timed out") if !defined($ret);
         }
     }
     return $ret;
@@ -1075,7 +1008,7 @@ device C<$serialdev>.
 
 =cut
 
-sub background_script_run {
+sub background_script_run {    # no:style:signatures
     my ($cmd, %args) = @_;
 
     bmwqemu::log_call(cmd => $cmd, %args);
@@ -1097,11 +1030,12 @@ C<$serialdev>.
 
 =cut
 
-sub assert_script_sudo {
+sub assert_script_sudo {    # no:style:signatures
     my ($cmd, $wait) = @_;
+    # Keep in mind C<str> needs to agree with the corresponding C<str> marker
+    # defined on C<$distri->script_sudo> itself.
     my $str = hashed_string("ASS$cmd");
-    script_sudo("$cmd; echo $str-\$?- > /dev/$serialdev", 0);
-    my $ret = wait_serial("$str-\\d+-", $wait);
+    my $ret = script_sudo("$cmd", $wait);
     $ret = ($ret =~ /$str-(\d+)-/)[0] if $ret;
     _handle_script_run_ret($ret, $cmd);
     return;
@@ -1119,7 +1053,7 @@ I<The implementation is distribution specific and not always available.>
 
 =cut
 
-sub script_sudo {
+sub script_sudo {    # no:style:signatures
     my $name = shift;
     my $wait = shift // 2;
 
@@ -1153,7 +1087,7 @@ and can be tweaked by setting the C<$wait> positional parameter.
 
 =cut
 
-sub script_output {
+sub script_output {    # no:style:signatures
     my $script = shift;
     my %args = testapi::compat_args(
         {
@@ -1186,8 +1120,7 @@ C< <autoinst_url>/files/autoyast/autoinst.xml> >
 
 =cut
 
-sub save_tmp_file {
-    my ($relpath, $content) = @_;
+sub save_tmp_file ($relpath, $content) {
     my $path = hashed_string($relpath);
 
     bmwqemu::log_call(path => $relpath);
@@ -1211,9 +1144,9 @@ This will return content of the file located in data/autoyast/autoinst.xml
 
 =cut
 
-sub get_test_data {
-    my ($path) = @_;
-    $path = get_var('CASEDIR') . '/data/' . $path;
+sub get_test_data ($path) {
+    defined $bmwqemu::vars{CASEDIR} or die 'Need variable CASEDIR';
+    $path = "$bmwqemu::vars{CASEDIR}/data/$path";
     bmwqemu::log_call(path => $path);
     unless (-e $path) {
         bmwqemu::diag("File doesn't exist: $path");
@@ -1227,7 +1160,7 @@ sub get_test_data {
 
 =head2 validate_script_output
 
-  validate_script_output($script, $code | $regexp [, timeout => $timeout] [,quiet => $quiet])
+  validate_script_output($script, $code | $regexp [, timeout => $timeout] [, quiet => $quiet] [, title => $title] [, fail_message => $fail_message])
 
 Deprecated mode
 
@@ -1238,14 +1171,25 @@ alternatively matches a regular expression. Use it as
 
   validate_script_output "cat /etc/hosts", sub { m/127.*localhost/ };
   validate_script_output "cat /etc/hosts", qr/127.*localhost/;
+  validate_script_output "cat /etc/hosts", qr/127.*localhost/, title => 'localhost check', fail_message => 'No localhost line in /etc/hosts!';
   validate_script_output "cat /etc/hosts", sub { $_ !~ m/987.*somehost/ };
 
 =cut
 
-sub validate_script_output {
+sub validate_script_output {    # no:style:signatures
     my ($script, $check, @args) = @_;
-
-    my $output = script_output($script, @args);
+    my %args = compat_args(
+        {
+            title => 'validate_script_output',
+            fail_message => 'output not validating',
+            timeout => undef,
+            proceed_on_failure => undef,
+            quiet => 1,    # less noise by default
+            type_command => undef,
+        }, ['timeout'], @args);
+    my $title = delete $args{title};
+    my $fail_message = delete $args{fail_message};
+    my $output = script_output($script, %args);
     my $res = 'ok';
 
     my $message = '';
@@ -1263,8 +1207,8 @@ sub validate_script_output {
         my $body = $deparse->coderef2text($check);
 
         $message = sprintf
-          "validate_script_output got:\n%s\n\nCheck function (deparsed code):\n%s",
-          $output, $body;
+          "Script:\n%s\n\nCheck function (deparsed code):\n%s\n\nOutput:\n%s",
+          $script, $body, $output;
     }
     elsif (reftype $check eq 'REGEXP') {
         if ($output !~ $check) {
@@ -1272,19 +1216,17 @@ sub validate_script_output {
             bmwqemu::diag("output does not match the regex:\n$output");
         }
         $message = sprintf
-          "validate_script_output got:\n%s\n\nRegular expression:\n%s",
-          $output, $check;
+          "Script:\n%s\n\nRegular expression:\n%s\n\nOutput:\n%s",
+          $script, $check, $output;
     }
     else {
         croak "Invalid use of validate_script_output(), second arg must be a coderef or regexp";
     }
     $autotest::current_test->record_resultfile(
-        'validate_script_output', $message,
+        $title, $message,
         result => $res,
     );
-    if ($res eq 'fail') {
-        croak "output not validating";
-    }
+    croak $fail_message if $res eq 'fail';
     return 0;
 }
 
@@ -1298,9 +1240,7 @@ I<The implementation is distribution specific and not always available.>
 
 =cut
 
-sub become_root {
-    return $distri->become_root;
-}
+sub become_root () { $distri->become_root }
 
 =head2 ensure_installed
 
@@ -1312,9 +1252,7 @@ I<The implementation is distribution specific and not always available.>
 
 =cut
 
-sub ensure_installed {
-    return $distri->ensure_installed(@_);
-}
+sub ensure_installed (@args) { $distri->ensure_installed(@args) }
 
 =head2 hashed_string
 
@@ -1325,10 +1263,8 @@ MD5 algorithm and taking the first characters.
 
 =cut
 
-sub hashed_string {
-    my ($string, $count) = @_;
+sub hashed_string ($string, $count = undef) {
     $count //= 5;
-
     my $hash = md5_base64($string);
     # + and / are problematic in regexps and shell commands
     $hash =~ s,\+,_,g;
@@ -1353,10 +1289,8 @@ Special characters naming:
 
 =cut
 
-sub send_key {
-    my $key = shift;
-    my %args = (@_ == 1) ? (do_wait => +shift()) : @_;
-    $args{do_wait} //= 0;
+sub send_key {    # no:style:signatures
+    my ($key, %args) = @_;
     $args{wait_screen_change} //= 0;
     bmwqemu::log_call(key => $key, %args);
     if ($args{wait_screen_change}) {
@@ -1375,9 +1309,8 @@ Hold one C<$key> until release it
 
 =cut
 
-sub hold_key {
-    my ($key) = @_;
-    bmwqemu::log_call('hold_key', key => $key);
+sub hold_key ($key) {
+    bmwqemu::log_call(key => $key);
     query_isotovideo('backend_hold_key', {key => $key});
 }
 
@@ -1389,9 +1322,8 @@ Release one C<$key> which is kept holding
 
 =cut
 
-sub release_key {
-    my $key = shift;
-    bmwqemu::log_call('release_key', key => $key);
+sub release_key ($key) {
+    bmwqemu::log_call(key => $key);
     query_isotovideo('backend_release_key', {key => $key});
 }
 
@@ -1399,7 +1331,7 @@ sub release_key {
 
   send_key_until_needlematch($tag, $key [, $counter, $timeout]);
 
-Send specific key until needle with C<$tag> is not matched or C<$counter> is 0.
+Send specific key until needle with C<$tag> is matched or C<$counter> is 0.
 C<$tag> can be string or C<ARRAYREF> (C<['tag1', 'tag2']>)
 Default counter is 20 steps, default timeout is 1s
 
@@ -1407,24 +1339,25 @@ Throws C<FailedNeedle> exception if needle is not matched until C<$counter> is 0
 
 =cut
 
-sub send_key_until_needlematch {
-    my ($tag, $key, $counter, $timeout) = @_;
-
+sub send_key_until_needlematch ($tag, $key, $counter = undef, $timeout = undef) {
     $counter //= 20;
     $timeout //= 1;
-    while (!check_screen($tag, $timeout)) {
+
+    my $real_timeout = 0;
+    while (!check_screen($tag, $real_timeout)) {
         wait_screen_change {
             send_key $key;
         };
-        if (!$counter--) {
+        if (--$counter <= 0) {
             assert_screen $tag, 1;
         }
+        $real_timeout = $timeout;
     }
 }
 
 =head2 type_string
 
-  type_string($string [, max_interval => <num> ] [, wait_screen_changes => <num> ] [, wait_still_screen => <num> ] [, secret => 1 ]
+  type_string($string [, max_interval => <num> ] [, wait_screen_change => <num> ] [, wait_still_screen => <num> ] [, secret => 1 ]
   [, timeout => <num>] [, similarity_level => <num>] [, lf => 1 ]);
 
 send a string of characters, mapping them to appropriate key names as necessary
@@ -1451,16 +1384,12 @@ enter a command line.
 
 =cut
 
-sub type_string {
+sub type_string {    # no:style:signatures
+
     # special argument handling for backward compat
     my $string = shift;
-    my %args;
-    if (@_ == 1) {    # backward compat
-        %args = (max_interval => $_[0]);
-    }
-    else {
-        %args = @_;
-    }
+    # backward compat
+    my %args = (@_ == 1) ? (max_interval => $_[0]) : @_;
     $string .= "\n" if $args{lf};
 
     if (is_serial_terminal) {
@@ -1473,8 +1402,9 @@ sub type_string {
     my $wait_still = $args{wait_still_screen} // 0;
     my $wait_timeout = $args{timeout} // 30;
     my $wait_sim_level = $args{similarity_level} // 47;
-    bmwqemu::log_call(string => $string, max_interval => $max_interval, wait_screen_changes => $wait, wait_still_screen => $wait_still,
-        timeout => $wait_timeout, similarity_level => $wait_sim_level);
+    my $wait_screen_change_sim_level = $args{wait_screen_change_similarity_level} // 60;
+    bmwqemu::log_call(string => $string, max_interval => $max_interval, wait_screen_change => $wait, wait_still_screen => $wait_still,
+        timeout => $wait_timeout, similarity_level => $wait_sim_level, $args{secret} ? (-masked => $string) : ());
     my @pieces;
     if ($wait) {
         # split string into an array of pieces of specified size
@@ -1486,7 +1416,7 @@ sub type_string {
     }
     for my $piece (@pieces) {
         if ($wait) {
-            wait_screen_change { query_isotovideo('backend_type_string', {text => $piece, max_interval => $max_interval}); };
+            wait_screen_change { query_isotovideo('backend_type_string', {text => $piece, max_interval => $max_interval}); } $wait_timeout, no_wait => 1, similarity_level => $wait_screen_change_sim_level;
         }
         else {
             query_isotovideo('backend_type_string', {text => $piece, max_interval => $max_interval});
@@ -1500,7 +1430,7 @@ sub type_string {
 
 =head2 type_password
 
-  type_password($password [, max_interval => <num> ] [, wait_screen_changes => <num> ] [, wait_still_screen => <num> ] [, timeout => <num>]
+  type_password($password [, max_interval => <num> ] [, wait_screen_change => <num> ] [, wait_still_screen => <num> ] [, timeout => <num>]
   [, similarity_level => <num>] );
 
 A convenience wrapper around C<type_string>, which doesn't log the string.
@@ -1511,7 +1441,7 @@ You can pass the same optional parameters as for C<type_string> function.
 
 =cut
 
-sub type_password {
+sub type_password {    # no:style:signatures
     my ($string, %args) = @_;
     $string //= $password;
     type_string $string, secret => 1, max_interval => ($args{max_interval} // 100), %args;
@@ -1519,7 +1449,7 @@ sub type_password {
 
 =head2 enter_cmd
 
-  enter_cmd($string [, max_interval => <num> ] [, wait_screen_changes => <num> ] [, wait_still_screen => <num> ] [, secret => 1 ]
+  enter_cmd($string [, max_interval => <num> ] [, wait_screen_change => <num> ] [, wait_still_screen => <num> ] [, secret => 1 ]
   [, timeout => <num>] [, similarity_level => <num>] );
 
 A convenience wrapper around C<type_string>, that adds a linefeed to execute a
@@ -1529,7 +1459,7 @@ You can pass the same optional parameters as for C<type_string> function.
 
 =cut
 
-sub enter_cmd {
+sub enter_cmd {    # no:style:signatures
     type_string shift, lf => 1, @_;
 }
 
@@ -1543,9 +1473,7 @@ Move mouse pointer to given coordinates
 
 =cut
 
-sub mouse_set {
-    my ($mx, $my) = @_;
-
+sub mouse_set ($mx, $my) {
     bmwqemu::log_call(x => $mx, y => $my);
     query_isotovideo('backend_mouse_set', {x => $mx, y => $my});
 }
@@ -1559,9 +1487,10 @@ Default hold time is 0.15s
 
 =cut
 
-sub mouse_click {
-    my $button = shift || 'left';
-    my $time = shift || 0.15;
+sub mouse_click ($button = undef, $time = undef) {
+    $button //= 'left';
+    $time //= $bmwqemu::vars{DEFAULT_CLICK_SLEEP};
+    $time //= 0.15;
     bmwqemu::log_call(button => $button, cursor_down => $time);
     query_isotovideo('backend_mouse_button', {button => $button, bstate => 1});
     sleep $time;
@@ -1576,9 +1505,10 @@ Same as mouse_click only for double click.
 
 =cut
 
-sub mouse_dclick(;$$) {
-    my $button = shift || 'left';
-    my $time = shift || 0.10;
+sub mouse_dclick ($button = undef, $time = undef) {
+    $button //= 'left';
+    $time //= $bmwqemu::vars{DEFAULT_DCLICK_SLEEP};
+    $time //= 0.10;
     bmwqemu::log_call(button => $button, cursor_down => $time);
     query_isotovideo('backend_mouse_button', {button => $button, bstate => 1});
     sleep $time;
@@ -1597,9 +1527,10 @@ Same as mouse_click only for triple click.
 
 =cut
 
-sub mouse_tclick(;$$) {
-    my $button = shift || 'left';
-    my $time = shift || 0.10;
+sub mouse_tclick ($button = undef, $time = undef) {
+    $button //= 'left';
+    $time //= $bmwqemu::vars{DEFAULT_DCLICK_SLEEP};
+    $time //= 0.10;
     bmwqemu::log_call(button => $button, cursor_down => $time);
     query_isotovideo('backend_mouse_button', {button => $button, bstate => 1});
     sleep $time;
@@ -1622,8 +1553,8 @@ Hide mouse cursor by moving it out of screen area.
 
 =cut
 
-sub mouse_hide(;$) {
-    my $border_offset = shift || 0;
+sub mouse_hide ($border_offset = undef) {
+    $border_offset //= 0;
     bmwqemu::log_call(border_offset => $border_offset);
     query_isotovideo('backend_mouse_hide', {border_offset => $border_offset});
 }
@@ -1641,8 +1572,7 @@ will be used to set up the locations and the needle location will be overridden.
 
 =cut
 
-sub mouse_drag {
-    my %args = @_;
+sub mouse_drag (%args) {
     my ($startx, $starty, $endx, $endy);
     # If full coordinates are provided, work with them as a priority,
     if (defined $args{startx} and defined $args{starty}) {
@@ -1751,8 +1681,7 @@ C<$distri->console_selected> is called with C<@args>.
 
 =cut
 
-sub select_console {
-    my ($testapi_console, @args) = @_;
+sub select_console ($testapi_console, @args) {
     bmwqemu::log_call(testapi_console => $testapi_console, @args);
     if (!exists $testapi_console_proxies{$testapi_console}) {
         $testapi_console_proxies{$testapi_console} = backend::console_proxy->new($testapi_console);
@@ -1793,8 +1722,7 @@ here.
 
 =cut
 
-sub console {
-    my ($testapi_console) = @_;
+sub console ($testapi_console = undef) {
     $testapi_console ||= current_console();
     bmwqemu::log_call(testapi_console => $testapi_console);
     if (!exists $testapi_console_proxies{$testapi_console}) {
@@ -1812,7 +1740,7 @@ if you did something to the system that affects the console (e.g. trigger reboot
 
 =cut
 
-sub reset_consoles {
+sub reset_consoles () {
     query_isotovideo('backend_reset_consoles');
     return;
 }
@@ -1825,9 +1753,7 @@ return C<undef>.
 
 =cut
 
-sub current_console {
-    return $autotest::selected_console;
-}
+sub current_console () { $autotest::selected_console }
 
 =head1 audio support
 
@@ -1843,22 +1769,20 @@ I<Only supported by qemu backend.>
 
 =cut
 
-sub start_audiocapture {
+sub start_audiocapture () {
     my $fn = $autotest::current_test->capture_filename;
     my $filename = join('/', bmwqemu::result_dir(), $fn);
     bmwqemu::log_call(filename => $filename);
     return query_isotovideo('backend_start_audiocapture', {filename => $filename});
 }
 
-sub _check_or_assert_sound {
-    my ($mustmatch, $check) = @_;
+sub _snd2png ($wavfile, $imgpath) { system("snd2png $wavfile $imgpath") }    # uncoverable statement
 
+sub _check_or_assert_sound ($mustmatch, $check = undef) {
     my $result = $autotest::current_test->stop_audiocapture();
     my $wavfile = join('/', bmwqemu::result_dir(), $result->{audio});
-    system("snd2png $wavfile $result->{audio}.png");
-
     my $imgpath = "$result->{audio}.png";
-
+    _snd2png($wavfile, $imgpath);
     return $autotest::current_test->verify_sound_image($imgpath, $mustmatch, $check);
 }
 
@@ -1873,8 +1797,7 @@ I<Only supported by QEMU backend.>
 
 =cut
 
-sub assert_recorded_sound {
-    my ($mustmatch) = @_;
+sub assert_recorded_sound ($mustmatch) {
     return _check_or_assert_sound $mustmatch;
 }
 
@@ -1889,8 +1812,7 @@ I<Only supported by QEMU backend.>
 
 =cut
 
-sub check_recorded_sound {
-    my ($mustmatch) = @_;
+sub check_recorded_sound ($mustmatch) {
     return _check_or_assert_sound $mustmatch, 1;
 }
 
@@ -1904,10 +1826,7 @@ Trigger backend specific power action, can be C<'on'>, C<'off'>, C<'acpi'> or C<
 
 =cut
 
-sub power {
-
-    # params: (on), off, acpi, reset
-    my ($action) = @_;
+sub power ($action) {
     bmwqemu::log_call(action => $action);
     query_isotovideo('backend_power', {action => $action});
 }
@@ -1922,8 +1841,7 @@ Returns true on success and false if C<$timeout> timeout is hit. Default timeout
 
 =cut
 
-sub check_shutdown {
-    my ($timeout) = @_;
+sub check_shutdown ($timeout = undef) {
     $timeout //= ONE_MINUTE;
     bmwqemu::log_call(timeout => $timeout);
     $timeout = bmwqemu::scale_timeout($timeout);
@@ -1934,9 +1852,7 @@ sub check_shutdown {
             sleep($timeout);
         }
         # -1 counts too
-        if ($is_shutdown) {
-            return 1;
-        }
+        return 1 if $is_shutdown;
         sleep 1;
         --$timeout;
     }
@@ -1954,9 +1870,7 @@ if C<$timeout> timeout is hit. Default timeout is 60s.
 
 =cut
 
-sub assert_shutdown {
-    my ($timeout) = @_;
-    $timeout //= ONE_MINUTE;
+sub assert_shutdown ($timeout = undef) {
     if (check_shutdown($timeout)) {
         $autotest::current_test->take_screenshot('ok');
         return;
@@ -1975,8 +1889,7 @@ if backend supports it, eject the CD
 
 =cut
 
-sub eject_cd {
-    my (%nargs) = @_;
+sub eject_cd (%nargs) {
     bmwqemu::log_call(%nargs);
     query_isotovideo(backend_eject_cd => \%nargs);
 }
@@ -1992,8 +1905,7 @@ This method is fatal in case the network device doesn't exist.
 
 =cut
 
-sub switch_network {
-    my (%nargs) = @_;
+sub switch_network (%nargs) {
     bmwqemu::log_call(%nargs);
     query_isotovideo(backend_switch_network => \%nargs);
 }
@@ -2011,8 +1923,7 @@ I<Currently only qemu backend is supported.>
 
 =cut
 
-sub save_memory_dump {
-    my %nargs = @_;
+sub save_memory_dump (%nargs) {
     $nargs{filename} ||= $autotest::current_test->{name};
 
     bmwqemu::log_call(%nargs);
@@ -2021,35 +1932,22 @@ sub save_memory_dump {
     query_isotovideo('backend_save_memory_dump', \%nargs);
 }
 
-=head2 save_storage_drives
+=head2 save_storage
 
-  save_storage_drives([$filename]);
+  save_storage(filename => undef);
 
-Saves all of the SUT drives using C<$filename> as part of the final filename,
-the default will be the current test's name. The disk number will be always present.
-
-This method must be called within a post_fail_hook.
+Saves all of the SUT volumes using C<$filename> as part of the final filename,
+the default will be the current test's name.
 
 I<Currently only qemu backend is supported.>
 
 =cut
 
-sub save_storage_drives {
-    my $filename ||= $autotest::current_test->{name};
-    die "save_storage_drives should be called within a post_fail_hook" unless ((caller(1))[3]) =~ /post_fail_hook/;
-
-    bmwqemu::log_call();
-    bmwqemu::diag("Trying to save machine drives");
-    bmwqemu::load_vars();
-
-    # Right now, we're saving all the disks
-    # sometimes we might not want to. This could be improved.
-    if (my $nd = $bmwqemu::vars{NUMDISKS}) {
-        for my $i (1 .. $nd) {
-            query_isotovideo('backend_save_storage_drives', {disk => $i, filename => $filename});
-        }
-    }
+sub save_storage (%nargs) {
+    $nargs{filename} ||= $autotest::current_test->{name};
+    query_isotovideo('backend_save_storage', \%nargs);
 }
+
 
 =head2 freeze_vm
 
@@ -2065,7 +1963,7 @@ I<Currently only qemu backend is supported.>
 
 =cut
 
-sub freeze_vm {
+sub freeze_vm () {
     # While it might be a good idea to allow the user to stop the vm within a test
     # we're not encouraging them to do that outside a post_fail_hook or at any point
     # in the test code.
@@ -2086,7 +1984,7 @@ I<Currently only qemu backend is supported.>
 
 =cut
 
-sub resume_vm {
+sub resume_vm () {
     bmwqemu::log_call();
     query_isotovideo('backend_cont_vm');
 }
@@ -2103,7 +2001,7 @@ file is then parsed as jUnit format and extra test results are created from it.
 =cut
 
 # XXX: To keep until tests are adapted
-sub parse_junit_log { return parse_extra_log('JUnit', shift) }
+sub parse_junit_log ($path) { return parse_extra_log('JUnit', $path) }
 
 =head2 parse_extra_log
 
@@ -2115,13 +2013,11 @@ Upload log file from SUT (calls upload_logs internally). The uploaded
 file is then parsed as the format supplied, that can be understood by OpenQA::Parser
  and extra test results are created from it.
 
- Formats currently supported are: JUnit, XUnit, LTP
+ Formats currently supported are: JUnit, XUnit, LTP, IPA, TAP
 
 =cut
 
-sub parse_extra_log {
-    my ($format, $file) = @_;
-
+sub parse_extra_log ($format, $file) {
     $file = upload_logs($file);
     my @tests;
 
@@ -2160,9 +2056,7 @@ Write a diagnostic message to the logfile. In color, if possible.
 
 =cut
 
-sub diag {
-    return bmwqemu::diag(@_);
-}
+sub diag (@args) { bmwqemu::diag(@args) }
 
 =head2 host_ip
 
@@ -2171,13 +2065,19 @@ sub diag {
 Return VM's host IP.
 In a kvm instance you reach the VM's host under default 10.0.2.2
 
+Optional named parameter C<inside_sut> in C<$args> will force using actual
+worker IP/hostname even on KVM guests if set to 0.
+
+In case of non-qemu tries to return a sane default if the test variable
+C<WORKER_HOSTNAME> was not specified.
+
 =cut
 
-sub host_ip { check_var('BACKEND', 'qemu') ? get_var('QEMU_HOST_IP', '10.0.2.2') : get_required_var('WORKER_HOSTNAME') }
+sub host_ip ($args = {}) { (check_var('BACKEND', 'qemu') && ($args->{inside_sut} // 1)) ? get_var('QEMU_HOST_IP', '10.0.2.2') : ($bmwqemu::vars{WORKER_HOSTNAME} //= hostfqdn) }
 
 =head2 autoinst_url
 
-  autoinst_url([$path, $query]);
+  autoinst_url([$path, $query, $args]);
 
 returns the base URL to contact the local C<os-autoinst> service
 
@@ -2186,17 +2086,19 @@ Optional C<$path> argument is appended after base url.
 Optional HASHREF C<$query> is converted to URL query and appended
 after path.
 
+Optional named parameter C<inside_sut> in C<$args> will force using actual worker IP/hostname
+even on KVM guests if set to 0.
+
 Returns constructor URL. Can be used inline:
 
   script_run("curl " . autoinst_url . "/data");
 
 =cut
 
-sub autoinst_url {
-    my ($path, $query) = @_;
+sub autoinst_url ($path = undef, $query = undef, $args = {}) {
     $path //= '';
     $query //= {};
-    my $hostname = get_var('AUTOINST_URL_HOSTNAME', host_ip());
+    my $hostname = get_var('AUTOINST_URL_HOSTNAME', host_ip($args));
     # QEMUPORT is historical for the base port of the worker instance
     my $workerport = get_var("QEMUPORT") + 1;
 
@@ -2218,8 +2120,7 @@ in the corresponding variable
 
 =cut
 
-sub data_url($) {
-    my ($name) = @_;
+sub data_url ($name) {
     autoinst_url($name =~ /^REPO_\d$/ ? "/assets/repo/" . get_var($name) :
           $name =~ /^ASSET_\d$/ ? "/assets/other/" . get_var($name) : "/data/$name");
 }
@@ -2240,9 +2141,7 @@ timeout is 90s. C<log_name> parameter allow to control resulted job's attachment
 
 =cut
 
-sub upload_logs {
-    my $file = shift;
-    my %args = @_;
+sub upload_logs ($file, %args) {
     my $failok = $args{failok} || 0;
     my $timeout = $args{timeout} || 90;
 
@@ -2258,7 +2157,7 @@ sub upload_logs {
     $cmd .= autoinst_url("/uploadlog/$basename");
     if ($failok) {
         # just use script_run so we don't care if the upload fails
-        script_run($cmd, $timeout, die_on_timeout => 1);
+        script_run($cmd, $timeout);
     }
     else {
         assert_script_run($cmd, $timeout);
@@ -2292,9 +2191,7 @@ C<$nocheck> parameter:
 
 =cut
 
-sub upload_asset {
-    my ($file, $public, $nocheck) = @_;
-
+sub upload_asset ($file, $public = undef, $nocheck = undef) {
     if (get_var('OFFLINE_SUT')) {
         record_info('upload skipped', "Skipped uploading asset '$file' as we are offline");
         return;
@@ -2326,14 +2223,17 @@ A typical call would look like:
 
 =cut
 
-sub compat_args {
-    my ($def_args, $fix_keys) = splice(@_, 0, 2);
+sub compat_args ($def_args, $fix_keys, @args) {
     my %ret;
-    for my $key (@{$fix_keys}) {
-        $ret{$key} = shift if (scalar(@_) >= 1 && (!defined($_[0]) || !grep { $_ eq $_[0] } keys(%{$def_args})));
+    if (@$fix_keys == 1) {
+        $ret{$fix_keys->[0]} = shift @args if ((@args % 2) != 0);
+    } else {
+        for my $key (@{$fix_keys}) {
+            $ret{$key} = shift @args if (@args >= 1 && (!defined($args[0]) || !exists $def_args->{$args[0]}));
+        }
     }
-    carp("Odd number of arguments") unless ((@_ % 2) == 0);
-    %ret = (%{$def_args}, %ret, @_);
+    carp("Odd number of arguments") unless ((@args % 2) == 0);
+    %ret = (%{$def_args}, %ret, @args);
     map { $ret{$_} //= $def_args->{$_} } keys(%{$def_args});
     return %ret;
 }
@@ -2352,7 +2252,7 @@ A typical call would look like:
 
 =cut
 
-sub show_curl_progress_meter { get_var('UPLOAD_METER') ? "-o /dev/$serialdev " : '' }
+sub show_curl_progress_meter () { get_var('UPLOAD_METER') ? "-o /dev/$serialdev " : '' }
 
 =head2 backend_get_wait_still_screen_on_here_doc_input
 
@@ -2362,7 +2262,7 @@ the here-document input can yield invalid script content.
 This function returns the value to be used by C<wait_still_screen> before
 starting to write the script into the here document.
 =cut
-sub backend_get_wait_still_screen_on_here_doc_input {
+sub backend_get_wait_still_screen_on_here_doc_input () {
     state $ret;
     $ret = query_isotovideo('backend_get_wait_still_screen_on_here_doc_input', {}) unless defined($ret);
     return get_var(_WAIT_STILL_SCREEN_ON_HERE_DOC_INPUT => $ret);

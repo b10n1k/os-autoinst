@@ -10,6 +10,7 @@
 #include <string.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 
 typedef Image *tinycv__Image;
 typedef VNCInfo *tinycv__VNCInfo;
@@ -52,6 +53,16 @@ static SysRet clib_send_with_fd(int sk, char *buf, size_t len, int fd)
 	return sendmsg(sk, &msg, 0);
 }
 
+static SysRet clib_set_socket_timeout(int sockfd, time_t seconds, suseconds_t microseconds)
+{
+    struct timeval tv;
+    tv.tv_sec = seconds;
+    tv.tv_usec = microseconds;
+    const auto error1 = setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, static_cast<const void *>(&tv), sizeof(tv));
+    const auto error2 = setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, static_cast<const void *>(&tv), sizeof(tv));
+    return error1 ? error1 : error2;
+}
+
 MODULE = tinycv     PACKAGE = tinycv
 
 PROTOTYPES: ENABLE
@@ -62,6 +73,13 @@ CODE:
        RETVAL = clib_send_with_fd(PerlIO_fileno(sk), buf, strlen(buf), fd);
 OUTPUT:
        RETVAL
+
+SysRet
+set_socket_timeout(int sockfd, time_t seconds)
+CODE:
+        RETVAL = clib_set_socket_timeout(sockfd, seconds, 0);
+OUTPUT:
+        RETVAL
 
 int
 default_thread_count()
@@ -92,7 +110,7 @@ tinycv::Image read(const char *file)
 tinycv::Image from_ppm(SV *data)
   CODE:
     STRLEN len;
-    register unsigned char *buf = (unsigned char*)SvPV(data, len);
+    unsigned char *buf = (unsigned char*)SvPV(data, len);
     RETVAL = image_from_ppm(buf, len);
 
   OUTPUT:
@@ -109,6 +127,14 @@ tinycv::VNCInfo new_vncinfo(bool do_endian_conversion, bool true_color, unsigned
 
    OUTPUT:
      RETVAL
+
+void get_colour(tinycv::VNCInfo info, unsigned int index)
+  PPCODE:
+    const auto color = image_get_vnc_color(info, index);
+    EXTEND(SP, 3);
+    PUSHs(sv_2mortal(newSVnv(std::get<0>(color))));
+    PUSHs(sv_2mortal(newSVnv(std::get<1>(color))));
+    PUSHs(sv_2mortal(newSVnv(std::get<2>(color))));
 
 void set_colour(tinycv::VNCInfo info, unsigned int index, unsigned red, unsigned green, unsigned blue)
    CODE:
@@ -189,6 +215,14 @@ void blend(tinycv::Image self, tinycv::Image source, long x, long y)
 void threshold(tinycv::Image self, int level)
   CODE:
     image_threshold(self, level);
+
+void get_pixel(tinycv::Image self, long x, long y)
+  PPCODE:
+    const auto pixel = image_get_pixel(self, x, y);
+    EXTEND(SP, 3);
+    PUSHs(sv_2mortal(newSVnv(std::get<0>(pixel))));
+    PUSHs(sv_2mortal(newSVnv(std::get<1>(pixel))));
+    PUSHs(sv_2mortal(newSVnv(std::get<2>(pixel))));
 
 void avgcolor(tinycv::Image self)
   PPCODE:

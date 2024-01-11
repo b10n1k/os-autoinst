@@ -33,9 +33,11 @@ my $report_timeout_called = 0;
 my $fake_pause_on_timeout = 0;
 my $fake_needle_found = 1;
 my $fake_needle_found_after_pause = 0;
+my $fake_timeout = 0;
+my $fake_similarity = 42;
 
 # define 'write_with_thumbnail' to fake image
-sub write_with_thumbnail { }
+sub write_with_thumbnail (@) { }
 
 sub fake_send_json ($to_fd, $cmd) { push(@$cmds, $cmd) }
 
@@ -84,9 +86,16 @@ sub fake_read_json ($fd) {
     elsif ($cmd eq 'backend_mouse_set') {
         return {ret => {x => 100, y => 100}};
     }
-    elsif ($cmd eq 'backend_get_wait_still_screen_on_here_doc_input') {
+    elsif ($cmd eq 'backend_get_wait_still_screen_on_here_doc_input' || $cmd eq 'backend_set_reference_screenshot') {
         return {ret => 0};
-    } else {
+    }
+    elsif ($cmd eq 'backend_wait_screen_change' || $cmd eq 'backend_wait_still_screen') {
+        return {ret => {sim => $fake_similarity, elapsed => 5, timed_out => $fake_timeout}};
+    }
+    elsif ($cmd eq 'backend_start_audiocapture') {
+        return {ret => 0};
+    }
+    else {
         note "mock method not implemented \$cmd: $cmd\n";
     }
     return {};
@@ -111,7 +120,9 @@ my $mock_bmwqemu = Test::MockModule->new('bmwqemu');
 
 subtest 'type_string' => sub {
     $mod2->redefine(wait_screen_change => sub : prototype(&@) {
-            my ($callback, $timeout) = @_;
+            my ($callback, $timeout, %args) = @_;
+            is $timeout, 30, 'expected timeout passed to wait_screen_change';
+            ok $args{no_wait}, 'no_wait parameter passed to wait_screen_change';
             $callback->() if $callback;
     });
 
@@ -168,6 +179,25 @@ subtest 'type_string' => sub {
 
     type_password 'hallo', max_interval => 5;
     is_deeply($cmds, [{cmd => 'backend_type_string', max_interval => 5, text => 'hallo'}]);
+    $cmds = [];
+};
+
+subtest 'wait_screen_change' => sub {
+    my $callback_invoked = 0;
+    ok wait_screen_change { $callback_invoked = 1 }, 'change found';
+    ok $callback_invoked, 'callback invoked';
+    my @expected_cmds = (
+        {cmd => 'backend_set_reference_screenshot'},
+        {cmd => 'backend_wait_screen_change', similarity_level => 50, timeout => 10},
+    );
+    is_deeply $cmds, \@expected_cmds, 'backend function wait_screen_change called (1)' or diag explain $cmds;
+    $cmds = [];
+
+    $fake_timeout = 1;
+    $expected_cmds[1]->{timeout} = 1;
+    $expected_cmds[1]->{similarity_level} = 51;
+    ok !wait_screen_change(sub { $callback_invoked = 1 }, 1, similarity_level => 51), 'no change found';
+    is_deeply $cmds, \@expected_cmds, 'backend function wait_screen_change called (2)' or diag explain $cmds;
     $cmds = [];
 };
 
@@ -236,13 +266,9 @@ subtest 'send_key with wait_screen_change' => sub {
 
 is($autotest::current_test->{dents}, 0, 'no soft failures so far');
 $mock_bmwqemu->unmock('log_call');
-stderr_like(\&record_soft_failure, qr/record_soft_failure\(reason=undef\)/, 'soft failure recorded in log');
-is($autotest::current_test->{dents}, 1, 'one dent recorded');
-is(scalar @{$autotest::current_test->{details}}, 1, 'exactly one detail added recorded');
-
 stderr_like { record_soft_failure('workaround for bug#1234') } qr/record_soft_failure.*reason=.*workaround for bug#1234.*/, 'soft failure with reason';
-is($autotest::current_test->{dents}, 2, 'one more dent recorded');
-is(scalar @{$autotest::current_test->{details}}, 2, 'exactly one more detail added recorded');
+is($autotest::current_test->{dents}, 1, 'one more dent recorded');
+is(scalar @{$autotest::current_test->{details}}, 1, 'exactly one more detail added recorded');
 my $details = $autotest::current_test->{details}[-1];
 my $details_ok = is($details->{title}, 'Soft Failed', 'title for soft failure added');
 $details_ok &= is($details->{result}, 'softfail', 'result correct');
@@ -295,20 +321,51 @@ subtest 'script_run' => sub {
     is(script_run('false', die_on_timeout => 1, output => 'foo'), '1', 'script_run with no check of success and output, returns exit code');
     is(script_run('false', 0, die_on_timeout => 1), undef, 'script_run with no check of success, returns undef when not waiting');
     $fake_matched = 0;
-    throws_ok { script_run('sleep 13', timeout => 10, die_on_timeout => 1, quiet => 1) } qr/command.*timed out/, 'exception occured on script_run() timeout';
+    throws_ok { script_run('sleep 13', timeout => 10, die_on_timeout => 1, quiet => 1) } qr/command.*timed out/, 'exception occurred on script_run() timeout';
     $testapi::distri->{script_run_die_on_timeout} = 1;
-    throws_ok { script_run('sleep 13', timeout => 10, quiet => 1) } qr/command.*timed out/, 'exception occured on script_run() timeout';
+    throws_ok { script_run('sleep 13', timeout => 10, quiet => 1) } qr/command.*timed out/, 'exception occurred on script_run() timeout';
+
+    throws_ok { assert_script_run('sleep 13', timeout => 10, quiet => 1) } qr/command.*timed out/, 'exception occurs on assert_script_run() timeout by default';
+    my $autotest_mock = Test::MockModule->new('autotest');
+    my @diag_messages;
+    $mock_bmwqemu->redefine(diag => sub ($msg) { push @diag_messages, $msg });
+    $autotest_mock->redefine(pause_on_failure => {ignore_failure => 1});
+    lives_ok { assert_script_run('sleep 13', timeout => 10, quiet => 1) } 'assert_script_run() timeout ignored if pausing on failure';
+    is_deeply \@diag_messages, ["ignoring failure via developer mode: command 'sleep 13' timed out"], 'ignored failure logged'
+      or diag explain \@diag_messages;
+
     $testapi::distri->{script_run_die_on_timeout} = -1;
     $fake_matched = 1;
 
-    stderr_like { script_run('true', quiet => 1) } qr/DEPRECATED/, 'DEPRECATED message appear if `die_on_timeout` is not given.';
-    stderr_unlike { script_run('true', die_on_timeout => 0, quiet => 1) } qr/DEPRECATED/, 'DEPRECATED does not appear, if `die_on_timeout=>0` is set.';
-    stderr_unlike { script_run('true', die_on_timeout => 1, quiet => 1) } qr/DEPRECATED/, 'DEPRECATED does not appear, if `die_on_timeout=>1` is set.';
+
+    stderr_unlike { script_run('true', quiet => 1) } qr/DEPRECATED/, 'DEPRECATED does not appear if `die_on_timeout` is not provided';
+    stderr_like { script_run('true', die_on_timeout => 0, quiet => 1) } qr/DEPRECATED/, 'DEPRECATED appears if `die_on_timeout` is used';
 
     $fake_matched = 1;
     $fake_exit = 1234;
     is(background_script_run('sleep 10'), '1234', 'background_script_run returns a PID');
     is(background_script_run('sleep 10', output => 'foo'), '1234', 'background_script_run with output returns valid PID');
+};
+
+sub assert_script_sudo_test ($waittime, $is_serial_terminal) {
+    my $mock_testapi = Test::MockModule->new('testapi');
+    $mock_testapi->noop(qw(send_key enter_cmd));
+    my $script_sudo = '';
+    $mock_testapi->redefine(hashed_string => 'XXX');
+    $mock_testapi->redefine(wait_serial => 'XXX-0-');
+    $mock_testapi->redefine(is_serial_terminal => $is_serial_terminal);
+    $mock_testapi->redefine(script_sudo => sub { $script_sudo = "$_[0]"; return "XXX-0-" });
+    is assert_script_sudo('echo foo', $waittime), undef, 'successful assertion of script_sudo (1)';
+    is $script_sudo, 'echo foo', 'script_sudo called like expected(1)';
+    is assert_script_sudo('bash', $waittime), undef, 'successful assertion of script_sudo (2)';
+    is $script_sudo, 'bash', 'script_sudo called like expected(2)';
+}
+
+subtest 'assert_script_sudo' => sub {
+    subtest('Test assert_script_sudo', \&assert_script_sudo_test, 0, 0);
+    subtest('Test assert_script_sudo', \&assert_script_sudo_test, 0, 1);
+    subtest('Test assert_script_sudo', \&assert_script_sudo_test, 10, 0);
+    subtest('Test assert_script_sudo', \&assert_script_sudo_test, 10, 1);
 };
 
 subtest 'check_assert_screen' => sub {
@@ -368,7 +425,7 @@ subtest 'check_assert_screen' => sub {
         is_deeply($autotest::current_test->{details}, [
                 {
                     result => 'unk',
-                    screenshot => 'basetest-15.png',
+                    screenshot => 'basetest-13.png',
                     frametime => [qw(1.75 1.79)],
                     tags => [qw(fake tags)],
                 }
@@ -425,7 +482,6 @@ subtest 'check_assert_screen' => sub {
 
 ok(save_screenshot);
 
-is(match_has_tag, undef, 'match_has_tag on no value -> undef');
 is(match_has_tag('foo'), undef, 'match_has_tag on not matched tag -> undef');
 subtest 'assert_and_click' => sub {
     my $mock_testapi = Test::MockModule->new('testapi');
@@ -476,7 +532,25 @@ subtest 'assert_and_click' => sub {
             cmd => 'backend_mouse_set',
             x => 61,
             y => 70,
-    }, 'assert_and_click clicks at the  click point specified as "center"') or diag explain $cmds;
+    }, 'assert_and_click clicks at the click point specified as "center"') or diag explain $cmds;
+
+    $cmds = [];
+    @areas = ({x => 50, y => 60, w => 22, h => 20, click_point => {xpos => 5, ypos => 7, id => 'first'}}, {x => 0, y => 0, w => 10, h => 10, click_point => {xpos => 5, ypos => 7, id => 'second'}});
+    ok(assert_and_click('foo', point_id => 'first'));
+    is_deeply($cmds->[1], {
+            cmd => 'backend_mouse_set',
+            x => 55,
+            y => 67,
+    }, 'assert_and_click clicks at the click point with ID "first"') or diag explain $cmds;
+
+    $cmds = [];
+    @areas = ({x => 50, y => 60, w => 22, h => 20, click_point => {xpos => 5, ypos => 7, id => 'first'}}, {x => 0, y => 0, w => 10, h => 10, click_point => {xpos => 5, ypos => 7, id => 'second'}});
+    ok(assert_and_click('foo', point_id => 'second'));
+    is_deeply($cmds->[1], {
+            cmd => 'backend_mouse_set',
+            x => 5,
+            y => 7,
+    }, 'assert_and_click clicks at the click point with ID "second"') or diag explain $cmds;
 
     is_deeply($cmds->[-1], {cmd => 'backend_mouse_set', x => 100, y => 100}, 'assert_and_click succeeds and move to old mouse set');
 
@@ -569,20 +643,37 @@ subtest 'validate_script_output' => sub {
         validate_script_output('script', sub { m/error/ })
     } qr/output not validating/, 'Die on output not match';
     throws_ok {
+        validate_script_output('script', qr/error/)
+    } qr/output not validating/, 'Die on output not match for regex';
+    throws_ok {
         validate_script_output('script', ['Invalid parameter'])
     } qr/coderef or regexp/, 'Die on invalid parameter';
+    throws_ok {
+        validate_script_output('script', qr/error/, fail_message => 'foo bar')
+    } qr/foo bar/, 'Die on output not match';
 
-    $mock_testapi->redefine(script_output => sub ($script, @args) { join(',', @args) });
-    my @exp_args_list = (
-        [123, proceed_on_failure => 1, type_command => 1],
-        [proceed_on_failure => 1, type_command => 1],
-        [type_command => 1],
-        [timeout => 1],
-        [123]
+    my $arguments;
+    my %script_output_defaults = (
+        timeout => undef,
+        proceed_on_failure => undef,
+        quiet => 1,
+        type_command => undef
     );
-    for my $exp_args (@exp_args_list) {
-        my $joined_args = join(',', @$exp_args);
-        lives_ok { validate_script_output('script', qr/^$joined_args$/, @$exp_args) } "Arguments passed to script_output($joined_args)";
+
+    $mock_testapi->redefine(script_output => sub ($script, @args) { $arguments = {@args}; return '' });
+    my @exp_args_list = (
+        [123, proceed_on_failure => 1, type_command => 1, fail_message => 'fail_message'] => {%script_output_defaults, timeout => 123, proceed_on_failure => 1, type_command => 1},
+        [123, title => "FOO"] => {%script_output_defaults, timeout => 123},
+        [title => "FOO", timeout => 123] => {%script_output_defaults, timeout => 123},
+        [123] => {%script_output_defaults, timeout => 123},
+        [fail_message => "FOO"] => {%script_output_defaults},
+
+    );
+    while (@exp_args_list) {
+        my $args = shift @exp_args_list;
+        my $exp = shift @exp_args_list;
+        validate_script_output('script', qr//, @$args);
+        is_deeply $arguments, $exp, 'Arguments passed to script_output' or diag explain $arguments;
     }
 };
 
@@ -595,7 +686,8 @@ subtest save_tmp_file => sub {
 };
 
 subtest 'wait_still_screen & assert_still_screen' => sub {
-    $mod->redefine(read_json => {ret => {sim => 999}});
+    $fake_similarity = 999;
+    $fake_timeout = 0;
     $mock_bmwqemu->noop('log_call');
     ok(wait_still_screen, 'default arguments');
     ok(wait_still_screen(3), 'still time specified');
@@ -611,6 +703,8 @@ subtest 'wait_still_screen & assert_still_screen' => sub {
     $testapi->redefine(wait_still_screen => sub { die "wait_still_screen(@_)" });
     like(exception { assert_still_screen similarity_level => 9999; }, qr/wait_still_screen\(similarity_level 9999\)/,
         'assert_still_screen forwards arguments to wait_still_screen');
+    $fake_timeout = 1;
+    ok !wait_still_screen, 'falsy return value on timeout';
 };
 
 subtest 'test console::console argument settings' => sub {
@@ -622,6 +716,10 @@ subtest 'test console::console argument settings' => sub {
     $console->set_args(tty => 43, foo => 'bar');
     is($console->{args}->{tty}, 43);
     is($console->{args}->{foo}, 'bar');
+};
+
+subtest 'test console::console::screen throws if not implemented' => sub {
+    throws_ok { consoles::console->new('dummy-console', {tty => 3})->screen } qr/needs to be implemented/, 'expected error message';
 };
 
 subtest 'check_assert_shutdown' => sub {
@@ -636,6 +734,7 @@ subtest 'check_assert_shutdown' => sub {
     $mod->redefine(read_json => {ret => 0});
     is(check_shutdown, 0, 'check_shutdown should return "false" if timeout is hit');
     throws_ok { assert_shutdown } qr/Machine didn't shut down!/, 'assert_shutdown should throw exception if timeout is hit';
+    $mod->redefine(read_json => \&fake_read_json);
 };
 
 subtest 'compat_args' => sub {
@@ -670,6 +769,7 @@ subtest 'compat_args' => sub {
 
     is_deeply({testapi::compat_args(\%def_args, [], a => 'Y', b => 666, k => 5)}, {a => 'Y', b => 666, c => $def_args{c}, k => 5}, 'Additional parameter 1');
     is_deeply({testapi::compat_args(\%def_args, [], k => 5)}, {a => $def_args{a}, b => $def_args{b}, c => $def_args{c}, k => 5}, 'Additional parameter 2');
+    is_deeply({testapi::compat_args(\%def_args, ['c'], k => 5)}, {a => $def_args{a}, b => $def_args{b}, c => $def_args{c}, k => 5}, 'Additional parameter - one fixed parameter');
     is_deeply({testapi::compat_args(\%def_args, ['c'], 666, k => 5)}, {a => $def_args{a}, b => $def_args{b}, c => 666, k => 5}, 'Additional parameter 3');
 
     like(warning { testapi::compat_args(\%def_args, [], a => 'Z', 'outch') }->[0], qr/^Odd number of arguments/, 'Warned on Odd number 1');
@@ -700,6 +800,7 @@ subtest 'check quiet option on script runs' => sub {
     is(assert_script_run('true', quiet => 0), undef, 'assert_script_run with _QUIET_SCRIPT_CALLS=1 and quiet=>0');
     ok(!validate_script_output('script', sub { m/output/ }, quiet => 0), 'validate_script_output with _QUIET_SCRIPT_CALLS=1 and quiet=>0');
     delete $bmwqemu::vars{_QUIET_SCRIPT_CALLS};
+    $mock_testapi->unmock('wait_serial');
 };
 
 subtest 'host_ip, autoinst_url' => sub {
@@ -718,9 +819,9 @@ subtest 'host_ip, autoinst_url' => sub {
 };
 
 subtest 'data_url' => sub {
-    like data_url 'foo', qr{localhost.*data/foo}, 'data_url returns local data reference by default';
+    like data_url('foo'), qr{localhost.*data/foo}, 'data_url returns local data reference by default';
     $bmwqemu::vars{ASSET_3} = 'foo.xml';
-    like data_url 'ASSET_3', qr{other/foo.xml}, 'data_url returns local data reference by default';
+    like data_url('ASSET_3'), qr{other/foo.xml}, 'data_url returns local data reference by default';
 };
 
 subtest '_calculate_clickpoint' => sub {
@@ -873,9 +974,136 @@ subtest 'show_curl_progress_meter' => sub {
 };
 
 subtest 'get_wait_still_screen_on_here_doc_input' => sub {
-    is(testapi::backend_get_wait_still_screen_on_here_doc_input({}) != 42, 1, 'Sanity check, that wait_still_screen_on_here_doc_input returns not 42!');
+    is(testapi::backend_get_wait_still_screen_on_here_doc_input != 42, 1, 'Sanity check, that wait_still_screen_on_here_doc_input returns not 42!');
     testapi::set_var(_WAIT_STILL_SCREEN_ON_HERE_DOC_INPUT => 42);
-    is(testapi::backend_get_wait_still_screen_on_here_doc_input({}), 42, 'The variable `_WAIT_STILL_SCREEN_ON_HERE_DOC_INPUT` has precedence over backend value!');
+    is(testapi::backend_get_wait_still_screen_on_here_doc_input, 42, 'The variable `_WAIT_STILL_SCREEN_ON_HERE_DOC_INPUT` has precedence over backend value!');
+};
+
+subtest init => sub {
+    testapi::init;
+    is $testapi::serialdev, 'ttyS0', 'init sets default serial device';
+    set_var('OFW', 1);
+    testapi::init;
+    is $testapi::serialdev, 'hvc0', 'init sets serial device for OFW/PPC';
+    set_var('OFW', 0);
+    set_var('ARCH', 's390x');
+    set_var('BACKEND', 'qemu');
+    testapi::init;
+    is $testapi::serialdev, 'ttysclp0', 'init sets serial device for s390x on QEMU backend';
+    set_var('ARCH', '');
+    set_var('BACKEND', '');
+    set_var('SERIALDEV', 'foo');
+    testapi::init;
+    is $testapi::serialdev, 'foo', 'custom serial device can be set';
+};
+
+lives_ok { force_soft_failure('boo#42') } 'can call force_soft_failure';
+
+subtest 'set_var' => sub {
+    $cmds = [];
+    lives_ok { set_var('FOO', 'BAR', reload_needles => 1) } 'can call set_var with reload_needles';
+    is_deeply $cmds, [{cmd => 'backend_reload_needles'}], 'reload_needles called' or diag explain $cmds;
+};
+
+subtest 'get_var_array and check_var_array' => sub {
+    set_var('MY_ARRAY', '1,2,FOO');
+    ok check_var_array('MY_ARRAY', 'FOO'), 'can check for value in array';
+    ok !check_var_array('MY_ARRAY', '4'), 'not present entry returns false';
+};
+
+like(exception { x11_start_program 'true' }, qr/implement x11_start_program/, 'x11_start_program needs specific implementation');
+
+subtest 'send_key_until_needlematch' => sub {
+    my $mock_testapi = Test::MockModule->new('testapi');
+
+    $mock_testapi->redefine(wait_screen_change => sub : prototype(&@) {
+            my ($callback, $timeout) = @_;
+            $callback->() if $callback;
+    });
+    $mock_testapi->redefine(_handle_found_needle => sub { return $_[0] });
+    $mock_testapi->redefine(assert_screen => sub { die 'assert_screen reached' });
+
+    my $mock_tinycv = Test::MockModule->new('tinycv');
+    $mock_tinycv->redefine(from_ppm => sub : prototype($) { return bless({} => __PACKAGE__); });
+
+    # Check immediate needle match
+    $fake_needle_found = 1;
+    $cmds = [];
+    send_key_until_needlematch('tag', 'esc');
+    is(scalar @$cmds, 1, 'needle matches immediately, no key sent') || diag explain $cmds;
+    is($cmds->[-1]->{cmd}, 'check_screen');
+    is($cmds->[-1]->{timeout}, 0);
+
+    # Needle never matches
+    $mock_testapi->unmock('send_key');
+    $fake_needle_found = $fake_needle_found_after_pause = 0;
+    $cmds = [];
+    throws_ok(sub { send_key_until_needlematch('tag', 'esc', 3); },
+        qr/assert_screen reached/,
+        'no candidate needle matched tags'
+    );
+
+    my $count_send_key = 0;
+    # Skip the first check_screen
+    shift @$cmds;
+    for my $cmd (@$cmds) {
+        is($cmd->{timeout}, 1, "timeout for other check_screen is nonzero") if $cmd->{cmd} eq 'check_screen';
+        $count_send_key++ if $cmd->{cmd} eq 'backend_send_key';
+    }
+    is($count_send_key, 3, 'tried to send_key three times') || diag explain $cmds;
+    $cmds = [];
+
+    $fake_needle_found = 1;
+};
+
+subtest 'mouse click' => sub {
+    $cmds = [];
+    mouse_click();
+    is $cmds->[0]{button}, 'left', 'mouse_click called with default button' or diag explain $cmds;
+    $cmds = [];
+    mouse_dclick();
+    is $cmds->[0]{button}, 'left', 'mouse_dclick called with default button' or diag explain $cmds;
+    $cmds = [];
+    mouse_tclick();
+    is $cmds->[0]{button}, 'left', 'mouse_tclick called with default button' or diag explain $cmds;
+};
+
+is_deeply testapi::_handle_found_needle(undef, undef, undef), undef, 'handle_found_needle returns no found needle by default';
+$bmwqemu::vars{CASEDIR} = 'foo';
+is get_test_data('foo'), undef, 'get_test_data can be called';
+lives_ok { become_root } 'become_root can be called';
+like(exception { ensure_installed }, qr/implement.*for your distri/, 'ensure_installed can be called');
+lives_ok { hold_key('ret') } 'hold_key can be called';
+lives_ok { release_key('ret') } 'release_key can be called';
+lives_ok { reset_consoles } 'reset_consoles can be called';
+
+subtest 'assert/check recorded sound' => sub {
+    $cmds = [];
+    lives_ok { start_audiocapture } 'start_audiocapture can be called';
+    like $cmds->[0]->{filename}, qr/captured\.wav/, 'audiocapture started with expected args' or diag explain $cmds;
+    my $mock_testapi = Test::MockModule->new('testapi');
+    $mock_testapi->noop('_snd2png');
+    $mock_basetest->noop('verify_sound_image');
+    ok assert_recorded_sound('foo'), 'assert_recorded_sound can be called';
+    ok check_recorded_sound('foo'), 'check_recorded_sound can be called';
+};
+
+lives_ok { power('on') } 'power can be called';
+lives_ok { save_memory_dump } 'save_memory_dump can be called';
+lives_ok { save_storage } 'save_storage can be called';
+lives_ok { freeze_vm } 'freeze_vm can be called';
+lives_ok { resume_vm } 'resume_vm can be called';
+
+subtest 'upload_asset and parse_junit_log' => sub {
+    my $mock_testapi = Test::MockModule->new('testapi');
+    $mock_testapi->noop('assert_script_run');
+    ok upload_asset('foo'), 'upload_asset can be called';
+    $mock_testapi->redefine(upload_logs => sub { die 'foo' });
+    like(exception { parse_junit_log('foo') }, qr/foo/, 'parse_junit_log calls upload_logs');
 };
 
 done_testing;
+
+END {
+    unlink 'vars.json';
+}

@@ -11,6 +11,15 @@ use Carp 'croak';
 
 our $VERSION;
 
+=head1 TESTING
+
+For testing you can use:
+
+https://github.com/os-autoinst/os-autoinst-distri-opensuse/blob/master/tests/kernel/virtio_console.pm
+https://github.com/os-autoinst/os-autoinst-distri-opensuse/blob/master/tests/kernel/virtio_console_long_output.pm
+https://github.com/os-autoinst/os-autoinst-distri-opensuse/blob/master/tests/kernel/virtio_console_user.pm
+=cut
+
 sub new ($class, $fd_read, $fd_write = undef) {
     my $self = ref($class) ne '' && $class->isa('consoles::serial_screen') ? $class : bless {class => $class}, $class;
     $self->{fd_read} = $fd_read;
@@ -42,9 +51,9 @@ sub send_key ($self, $nargs) {
     $self->type_string($nargs);
 }
 
-sub hold_key { croak $trying_to_use_keys }
+sub hold_key ($self, $args) { croak $trying_to_use_keys }
 
-sub release_key { croak $trying_to_use_keys }
+sub release_key ($self, $args) { croak $trying_to_use_keys }
 
 =head2 type_string
 
@@ -69,7 +78,7 @@ consoles.
 sub type_string ($self, $nargs) {
     my $fd = $self->{fd_write};
 
-    bmwqemu::log_call(%$nargs);
+    bmwqemu::log_call(%$nargs, $nargs->{secret} ? (-masked => $nargs->{text}) : ());
 
     my $text = $nargs->{text};
     my $term;
@@ -84,7 +93,7 @@ sub type_string ($self, $nargs) {
     croak "Was not able to write entire message to virtio/svirt serial terminal. Only $written of $nargs->{text}" if $written < length($text);
 }
 
-sub thetime { clock_gettime(CLOCK_MONOTONIC) }
+sub thetime () { clock_gettime(CLOCK_MONOTONIC) }
 
 sub elapsed ($start) {
     no integer;
@@ -122,7 +131,8 @@ An undefined timeout will cause to wait indefinitely. A timeout of 0 means to
 just read once.
 
 =cut
-sub do_read ($self, $, %args) {
+sub do_read {    # no:style:signatures
+    my ($self, undef, %args) = @_;
     my $buffer = '';
     $args{timeout} //= undef;    # wait till data is available
     $args{max_size} //= 2048;
@@ -139,6 +149,8 @@ sub do_read ($self, $, %args) {
         $read = sysread($fd, $buffer, $args{max_size});
         croak "Failed to read from virtio/svirt serial console char device: $ERRNO" if !defined($read) && !($ERRNO{EAGAIN} || $ERRNO{EWOULDBLOCK});
     }
+    # this is why we can't use a signature for this function,
+    # assigning to @_ in a function with signature triggers a warning
     $_[1] = $buffer;
     return $read;
 }
@@ -274,8 +286,8 @@ sub peak ($self, %nargs) {
     return $self->{carry_buffer};
 }
 
-sub current_screen { 0 }
+sub current_screen ($self) { 0 }
 
-sub request_screen_update { }
+sub request_screen_update ($self, @) { }
 
 1;
